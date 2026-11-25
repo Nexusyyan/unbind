@@ -1157,15 +1157,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1250));
 
         let capture = mgr.stop_session(&sid).expect("stop_session");
-        let target_lower = probe_file.to_string_lossy().to_lowercase();
-        let found = capture
-            .added_files
-            .iter()
-            .any(|p| p.to_lowercase() == target_lower);
+        // Windows kernel ETW reports canonical long paths (e.g. "runneradmin"), whereas
+        // tempdir() may use 8.3 short paths (e.g. "RUNNER~1"). Compare canonical paths.
+        let target_canon = std::fs::canonicalize(&probe_file).unwrap_or_else(|_| probe_file.clone());
+        let found = capture.added_files.iter().any(|p| {
+            std::fs::canonicalize(p)
+                .map(|c| c == target_canon)
+                .unwrap_or(false)
+        });
         assert!(
             found,
-            "Expected ETW to capture newly created probe file {}, captured {} files",
+            "Expected ETW to capture newly created probe file {} (canonical {}), captured {} files",
             probe_file.display(),
+            target_canon.display(),
             capture.added_files.len()
         );
     }
