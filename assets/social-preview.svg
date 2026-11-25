@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" fill="none">
+  <defs>
+    <linearGradient id="bgCanvas" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="58%" stop-color="#FAFAFB" />
+      <stop offset="100%" stop-color="#F4F4F6" />
+    </linearGradient>
+    <linearGradient id="iconTileBg" x1="84" y1="0" x2="84" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#F5F5F7" />
+    </linearGradient>
+    <linearGradient id="iconPrimary" x1="200" y1="420" x2="500" y2="690" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#27272A" />
+      <stop offset="100%" stop-color="#141417" />
+    </linearGradient>
+    <linearGradient id="iconSecondary" x1="520" y1="340" x2="824" y2="600" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7B7B85" />
+      <stop offset="100%" stop-color="#52525B" />
+    </linearGradient>
+    <filter id="tileShadow" x="-16%" y="-14%" width="132%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#18181B" flood-opacity="0.07" />
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#18181B" flood-opacity="0.04" />
+    </filter>
+    <pattern id="swissGrid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#18181B" stroke-opacity="0.032" stroke-width="1" />
+    </pattern>
+  </defs>
+
+  <!-- Pure neutral canvas + whisper Swiss grid -->
+  <rect width="1280" height="640" fill="url(#bgCanvas)" />
+  <rect width="1280" height="640" fill="url(#swissGrid)" />
+
+  <!-- Subtle architectural border inset -->
+  <rect x="28" y="28" width="1224" height="584" rx="24" stroke="#18181B" stroke-opacity="0.06" stroke-width="1.5" />
+
+  <!-- Oversized editorial Decouple watermark on right edge -->
+  <g transform="translate(815 -70) scale(0.76)" opacity="0.045">
+    <g transform="rotate(-45 512 512)" stroke-width="88" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 458 460 H 340 A 96 96 0 0 0 340 652 H 458" stroke="#18181B" />
+      <path d="M 566 372 H 684 A 96 96 0 0 1 684 564 H 566" stroke="#18181B" />
+    </g>
+  </g>
+
+  <!-- Brand Lockup -->
+  <g transform="translate(108 164)">
+    <!-- 164x164 Squircle Tile -->
+    <g filter="url(#tileShadow)">
+      <g transform="scale(0.16015625)">
+        <rect x="56" y="56" width="912" height="912" rx="224" fill="url(#iconTileBg)" />
+        <rect x="60" y="60" width="904" height="904" rx="220" stroke="#18181B" stroke-opacity="0.08" stroke-width="8" />
+        <g transform="rotate(-45 512 512)" stroke-width="88" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M 458 460 H 340 A 96 96 0 0 0 340 652 H 458" stroke="url(#iconPrimary)" />
+          <path d="M 566 372 H 684 A 96 96 0 0 1 684 564 H 566" stroke="url(#iconSecondary)" />
+        </g>
+      </g>
+    </g>
+
+    <!-- Wordmark + Tagline -->
+    <text
+      x="196"
+      y="84"
+      fill="#1A1A1D"
+      font-family="Segoe UI Variable Display, Segoe UI, Inter, system-ui, sans-serif"
+      font-size="76"
+      font-weight="600"
+      letter-spacing="-2.4"
+    >Unbind</text>
+
+    <text
+      x="198"
+      y="130"
+      fill="#6E6E77"
+      font-family="Segoe UI Variable Text, Segoe UI, Inter, system-ui, sans-serif"
+      font-size="23"
+      font-weight="400"
+      letter-spacing="-0.2"
+    >Cleanly decouple software from Windows without leftover traces.</text>
+  </g>
+
+  <!-- Minimal Feature Pills -->
+  <g transform="translate(116 392)" font-family="Segoe UI Variable Text, Segoe UI, Inter, system-ui, sans-serif" font-size="16" font-weight="500">
+    <rect x="0" y="0" width="164" height="40" rx="20" fill="#FFFFFF" stroke="#18181B" stroke-opacity="0.08" stroke-width="1.2" />
+    <text x="82" y="25.5" text-anchor="middle" fill="#1A1A1D">Rust + Tauri v2</text>
+
+    <rect x="178" y="0" width="194" height="40" rx="20" fill="#FFFFFF" stroke="#18181B" stroke-opacity="0.08" stroke-width="1.2" />
+    <text x="275" y="25.5" text-anchor="middle" fill="#3F3F46">Win32 / MSI / UWP</text>
+
+    <rect x="386" y="0" width="176" height="40" rx="20" fill="#FFFFFF" stroke="#18181B" stroke-opacity="0.08" stroke-width="1.2" />
+    <text x="474" y="25.5" text-anchor="middle" fill="#3F3F46">Install Tracker</text>
+
+    <rect x="576" y="0" width="214" height="40" rx="20" fill="#FFFFFF" stroke="#18181B" stroke-opacity="0.08" stroke-width="1.2" />
+    <text x="683" y="25.5" text-anchor="middle" fill="#3F3F46">Single Portable Exe</text>
+  </g>
+
+  <!-- Subtle bottom metadata footer -->
+  <line x1="116" y1="510" x2="1164" y2="510" stroke="#18181B" stroke-opacity="0.06" stroke-width="1" />
+  <text
+    x="116"
+    y="550"
+    fill="#9A9AA3"
+    font-family="Consolas, ui-monospace, monospace"
+    font-size="15"
+  >unbind.exe  |  Leftover Scanner  |  Restart Manager Unlocker  |  Startup Manager</text>
+  <text
+    x="1164"
+    y="550"
+    text-anchor="end"
+    fill="#6E6E77"
+    font-family="Consolas, ui-monospace, monospace"
+    font-size="15"
+  >MIT Open Source</text>
+</svg>

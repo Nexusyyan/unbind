@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="tileBg" x1="512" y1="56" x2="512" y2="968" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#F5F5F7" />
+    </linearGradient>
+    <linearGradient id="primaryLink" x1="200" y1="420" x2="500" y2="690" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#27272A" />
+      <stop offset="100%" stop-color="#141417" />
+    </linearGradient>
+    <linearGradient id="secondaryLink" x1="520" y1="340" x2="824" y2="600" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7B7B85" />
+      <stop offset="100%" stop-color="#52525B" />
+    </linearGradient>
+  </defs>
+
+  <rect x="56" y="56" width="912" height="912" rx="224" fill="url(#tileBg)" />
+  <rect
+    x="60"
+    y="60"
+    width="904"
+    height="904"
+    rx="220"
+    stroke="#18181B"
+    stroke-opacity="0.08"
+    stroke-width="8"
+  />
+
+  <g
+    transform="rotate(-45 512 512)"
+    stroke-width="88"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M 458 460 H 340 A 96 96 0 0 0 340 652 H 458" stroke="url(#primaryLink)" />
+    <path d="M 566 372 H 684 A 96 96 0 0 1 684 564 H 566" stroke="url(#secondaryLink)" />
+  </g>
+</svg>
