@@ -6,11 +6,12 @@ Lightweight, portable Windows software uninstaller, leftover scanner, install tr
 
 - **Stack**: Rust + Tauri v2 + React 19 + TypeScript + Tailwind CSS v4 + `pnpm` (single root Cargo Workspace)
 - **Key paths**:
-  - `crates/unbind-core/` -- Core Windows engine (discovery, real-size cache, safety, leftover scanner, SCM service removal, Restart Manager unlocker, startup manager, hybrid install tracker, HKCU shell integration, WinHTTP updater, IPC)
+  - `crates/unbind-core/` -- Core Windows engine (discovery, real-size cache, safety, leftover scanner, SCM service removal, Restart Manager unlocker, startup manager, portable software library, ETW real-time + hybrid install tracker, Winget updater, HKCU shell integration, WinHTTP release updater, IPC)
   - `src-tauri/` -- Tauri v2 desktop host, single-instance CLI router, window bounds persistence, Named Pipe UAC elevation bridge, dual-mode `--elevated-worker`
   - `src/` -- Minimalist neutral React + TypeScript UI (`src/i18n/locales/{en,zh-CN}.json`)
   - `DESIGN.md` -- Canonical UI design system and brand specification
-  - `.github/workflows/{ci,release}.yml` -- Automated Windows CI and portable GitHub Release workflow
+  - `CHANGELOG.md` -- Structured version history
+  - `.github/workflows/{ci,release}.yml` -- Automated Windows CI (Node 24) and portable GitHub Release workflow
 
 ## Verification Commands
 

@@ -32,6 +32,21 @@ impl IconCache {
         extracted
     }
 
+    pub fn get_or_extract_for_path(&self, key: &str, exe_path: &Path) -> Option<String> {
+        if let Ok(guard) = self.cache.lock() {
+            if let Some(hit) = guard.get(key) {
+                return hit.clone();
+            }
+        }
+
+        let extracted = extract_from_path(exe_path, 0);
+
+        if let Ok(mut guard) = self.cache.lock() {
+            guard.insert(key.to_string(), extracted.clone());
+        }
+        extracted
+    }
+
     pub fn clear(&self) {
         if let Ok(mut guard) = self.cache.lock() {
             guard.clear();

@@ -54,6 +54,7 @@ export function computeFilterCounts(
     query: string;
     showSystemComponents: boolean;
     showWindowsUpdates: boolean;
+    updatableAppIds?: Set<string>;
   },
 ): Record<AppFilterMode, number> {
   const tokens = options.query
@@ -64,6 +65,7 @@ export function computeFilterCounts(
 
   const counts: Record<AppFilterMode, number> = {
     all: 0,
+    updatable: 0,
     recent: 0,
     large: 0,
     broken: 0,
@@ -88,6 +90,7 @@ export function computeFilterCounts(
 
     if (visibleInStandard) {
       counts.all++;
+      if (options.updatableAppIds?.has(app.id)) counts.updatable++;
       if (isRecentDate(app.installDate, 30)) counts.recent++;
       if (app.estimatedSizeKb >= 100 * 1024) counts.large++;
       if (!app.isValidEntry) counts.broken++;
@@ -107,6 +110,7 @@ export function filterAndSortApps(
     sortDesc: boolean;
     showSystemComponents: boolean;
     showWindowsUpdates: boolean;
+    updatableAppIds?: Set<string>;
   },
 ): InstalledApp[] {
   const tokens = options.query
@@ -127,6 +131,9 @@ export function filterAndSortApps(
       if (!options.showWindowsUpdates && app.isWindowsUpdate) return false;
     }
 
+    if (options.filterMode === "updatable" && !options.updatableAppIds?.has(app.id)) {
+      return false;
+    }
     if (options.filterMode === "recent" && !isRecentDate(app.installDate, 30)) {
       return false;
     }

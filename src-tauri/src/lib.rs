@@ -79,6 +79,9 @@ fn restore_window_bounds(window: &tauri::WebviewWindow, bounds: &WindowBounds) {
 }
 
 fn persist_window_bounds(window: &tauri::Window, state: &AppState) {
+    if window.is_minimized().unwrap_or(false) {
+        return;
+    }
     let maximized = window.is_maximized().unwrap_or(false);
     let storage = state.current_storage();
     let mut settings = storage.load_settings();
@@ -174,6 +177,7 @@ pub fn run(initial_cli_action: Option<CliAction>) {
             commands::set_startup_enabled,
             commands::delete_startup_item,
             commands::start_install_track,
+            commands::poll_install_track_stats,
             commands::finish_install_track,
             commands::cancel_install_track,
             commands::list_active_track_sessions,
@@ -182,6 +186,12 @@ pub fn run(initial_cli_action: Option<CliAction>) {
             commands::delete_install_trace,
             commands::export_install_trace,
             commands::import_install_trace,
+            commands::list_portable_apps,
+            commands::get_portable_app_icons,
+            commands::launch_portable_app,
+            commands::create_portable_shortcut,
+            commands::check_winget_updates,
+            commands::run_winget_upgrade,
             commands::list_registry_backups,
             commands::preview_registry_backup,
             commands::restore_registry_backup,
@@ -204,6 +214,7 @@ pub fn run(initial_cli_action: Option<CliAction>) {
 
     app.run(|app_handle, event| {
         if let RunEvent::Exit = event {
+            unbind_core::ipc::worker_etw_manager().stop_all_sessions();
             if let Some(state) = app_handle.try_state::<AppState>() {
                 state.elevation.shutdown();
             }

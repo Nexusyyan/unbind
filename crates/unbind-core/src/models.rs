@@ -231,6 +231,36 @@ pub struct StartupItem {
     pub requires_elevation: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrackMode {
+    #[default]
+    HybridSnapshot,
+    EtwRealtime,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EtwSessionStats {
+    pub session_id: String,
+    pub etw_active: bool,
+    pub tracked_pid_count: usize,
+    pub captured_file_count: usize,
+    pub captured_reg_count: usize,
+    pub total_events: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EtwCaptureResult {
+    pub added_files: Vec<String>,
+    pub added_dirs: Vec<String>,
+    pub added_registry_keys: Vec<String>,
+    pub added_registry_values: Vec<TrackedRegValue>,
+    pub tracked_pids: Vec<u32>,
+    pub total_events: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallTrace {
@@ -250,6 +280,10 @@ pub struct InstallTrace {
     #[serde(default)]
     pub watched_roots: Vec<String>,
     pub total_size_bytes: u64,
+    #[serde(default)]
+    pub track_mode: TrackMode,
+    #[serde(default)]
+    pub etw_event_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -275,6 +309,68 @@ pub struct ActiveTrackSession {
     pub installer_pid: Option<u32>,
     #[serde(default)]
     pub installer_exited: bool,
+    #[serde(default)]
+    pub track_mode: TrackMode,
+    #[serde(default)]
+    pub etw_active: bool,
+    #[serde(default)]
+    pub tracked_pid_count: usize,
+    #[serde(default)]
+    pub captured_file_count: usize,
+    #[serde(default)]
+    pub captured_reg_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableApp {
+    pub id: String,
+    pub name: String,
+    pub publisher: String,
+    pub version: String,
+    pub exe_path: String,
+    pub install_dir: String,
+    pub root_dir: String,
+    pub size_bytes: u64,
+    pub last_modified: String,
+    pub is_single_file: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShortcutLocation {
+    Desktop,
+    StartMenu,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WingetUpdateInfo {
+    pub name: String,
+    pub package_id: String,
+    pub current_version: String,
+    pub available_version: String,
+    pub source: String,
+    pub matched_app_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WingetCheckResult {
+    pub available: bool,
+    pub winget_version: String,
+    pub updates: Vec<WingetUpdateInfo>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WingetUpgradeResult {
+    pub package_id: String,
+    pub app_name: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +419,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub custom_track_roots: Vec<String>,
     #[serde(default)]
+    pub portable_app_roots: Vec<String>,
+    #[serde(default)]
+    pub default_track_mode: TrackMode,
+    #[serde(default)]
     pub window_bounds: Option<WindowBounds>,
 }
 
@@ -339,6 +439,8 @@ impl Default for AppSettings {
             language: "auto".to_string(),
             theme: "system".to_string(),
             custom_track_roots: Vec::new(),
+            portable_app_roots: Vec::new(),
+            default_track_mode: TrackMode::HybridSnapshot,
             window_bounds: None,
         }
     }

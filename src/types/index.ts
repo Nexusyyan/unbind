@@ -127,6 +127,17 @@ export interface StartupItem {
   requiresElevation: boolean;
 }
 
+export type TrackMode = "hybridSnapshot" | "etwRealtime";
+
+export interface EtwSessionStats {
+  sessionId: string;
+  etwActive: boolean;
+  trackedPidCount: number;
+  capturedFileCount: number;
+  capturedRegCount: number;
+  totalEvents: number;
+}
+
 export interface TrackedRegValue {
   keyPath: string;
   valueName: string;
@@ -146,6 +157,8 @@ export interface InstallTrace {
   addedScheduledTasks?: string[];
   watchedRoots?: string[];
   totalSizeBytes: number;
+  trackMode?: TrackMode;
+  etwEventCount?: number;
 }
 
 export interface ActiveTrackSession {
@@ -159,6 +172,50 @@ export interface ActiveTrackSession {
   watchedRoots?: string[];
   installerPid?: number | null;
   installerExited?: boolean;
+  trackMode?: TrackMode;
+  etwActive?: boolean;
+  trackedPidCount?: number;
+  capturedFileCount?: number;
+  capturedRegCount?: number;
+}
+
+export interface PortableApp {
+  id: string;
+  name: string;
+  publisher: string;
+  version: string;
+  exePath: string;
+  installDir: string;
+  rootDir: string;
+  sizeBytes: number;
+  lastModified: string;
+  isSingleFile: boolean;
+}
+
+export type ShortcutLocation = "desktop" | "startMenu";
+
+export interface WingetUpdateInfo {
+  name: string;
+  packageId: string;
+  currentVersion: string;
+  availableVersion: string;
+  source: string;
+  matchedAppId: string | null;
+}
+
+export interface WingetCheckResult {
+  available: boolean;
+  wingetVersion: string;
+  updates: WingetUpdateInfo[];
+  error: string | null;
+}
+
+export interface WingetUpgradeResult {
+  packageId: string;
+  appName: string;
+  success: boolean;
+  exitCode: number | null;
+  message: string;
 }
 
 export interface BackupEntry {
@@ -197,6 +254,8 @@ export interface AppSettings {
   language: string;
   theme: string;
   customTrackRoots?: string[];
+  portableAppRoots?: string[];
+  defaultTrackMode?: TrackMode;
   windowBounds?: WindowBounds | null;
 }
 
@@ -239,13 +298,16 @@ export type ExportFormat = "html" | "csv" | "json";
 export type NavTab =
   | "apps"
   | "store"
-  | "startup"
+  | "tools"
   | "tracker"
   | "backups"
   | "settings";
 
+export type ToolsSubTab = "startup" | "portable";
+
 export type AppFilterMode =
   | "all"
+  | "updatable"
   | "recent"
   | "large"
   | "broken"

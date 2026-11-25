@@ -15,11 +15,16 @@ use unbind_core::export::export_apps_list;
 use unbind_core::ipc::WorkerRequest;
 use unbind_core::models::{
     ActiveTrackSession, AppKind, AppSettings, BackupEntry, CleanupOptions, CleanupReport,
-    CoreError, ExportFormat, InstallScope, InstallTrace, InstalledApp, LeftoverItem,
-    LockingProcessInfo, OperationLogEntry, RunningProcessInfo, ShellIntegrationStatus,
-    StartupItem, SystemStatus, UninstallExecutionResult, UpdateCheckResult,
+    CoreError, EtwCaptureResult, EtwSessionStats, ExportFormat, InstallScope, InstallTrace,
+    InstalledApp, LeftoverItem, LockingProcessInfo, OperationLogEntry, PortableApp,
+    RunningProcessInfo, ShellIntegrationStatus, ShortcutLocation, StartupItem, SystemStatus,
+    TrackMode, UninstallExecutionResult, UpdateCheckResult, WingetCheckResult, WingetUpgradeResult,
 };
 use unbind_core::portable::AppStorage;
+use unbind_core::portable_apps::{
+    create_portable_shortcut as core_create_portable_shortcut,
+    launch_portable_app as core_launch_portable_app, scan_portable_apps as core_scan_portable_apps,
+};
 use unbind_core::safety::{
     create_system_restore_point, delete_backup_file, is_process_elevated, list_backups,
     preview_registry_backup as core_preview_backup, reg_backup_requires_elevation,
@@ -43,10 +48,16 @@ use unbind_core::unlocker::{
     find_locking_processes, find_running_processes_in_dir, terminate_processes,
 };
 use unbind_core::updater::check_github_release;
+use unbind_core::winget::{
+    check_winget_updates as core_check_winget_updates,
+    run_winget_upgrade as core_run_winget_upgrade,
+};
+use uuid::Uuid;
 
 pub struct AppState {
     pub storage: Mutex<AppStorage>,
     pub apps_cache: Arc<Mutex<Vec<InstalledApp>>>,
+    pub portable_cache: Arc<Mutex<Vec<PortableApp>>>,
     pub icon_cache: IconCache,
     pub tracker: TrackerManager,
     pub elevation: ElevationBridge,
@@ -59,6 +70,7 @@ impl AppState {
         Self {
             storage: Mutex::new(AppStorage::detect()),
             apps_cache: Arc::new(Mutex::new(Vec::new())),
+            portable_cache: Arc::new(Mutex::new(Vec::new())),
             icon_cache: IconCache::new(),
             tracker: TrackerManager::new(),
             elevation: ElevationBridge::new(),
@@ -444,16 +456,98 @@ pub async fn start_install_track(
     installer_path: String,
     launch_installer: bool,
     extra_roots: Option<Vec<String>>,
+    track_mode: Option<TrackMode>,
 ) -> Result<ActiveTrackSession, String> {
     let roots = extra_roots.unwrap_or_default();
+    let mode = track_mode.unwrap_or(TrackMode::HybridSnapshot);
     let handle = app_handle.clone();
+
+    if mode == TrackMode::EtwRealtime {
+        let trimmed_installer = installer_path.trim();
+        if trimmed_installer.is_empty() || !launch_installer {
+            return Err(
+                "ETW real-time mode requires selecting an installer and enabling auto-launch"
+                    .to_string(),
+            );
+        }
+
+        let session_id = Uuid::new_v4().to_string();
+        let track_msi_service = trimmed_installer.to_ascii_lowercase().ends_with(".msi");
+
+        // 1. Start named real-time ETW session in pre-bind buffer mode BEFORE launching installer.
+        state
+            .elevation
+            .execute(WorkerRequest::StartEtwTrack {
+                session_id: session_id.clone(),
+                track_msi_service,
+            })
+            .map_err(|e| e.to_string())?;
+
+        // 2. Capture baseline snapshot and launch installer from the standard UI process.
+        let started = state.tracker.start_session_with_mode(
+            Some(session_id.clone()),
+            &app_name,
+            trimmed_installer,
+            true,
+            &roots,
+            TrackMode::EtwRealtime,
+            true,
+            Some(Box::new(move |sid, exit_code| {
+                let _ = handle.emit(
+                    "tracker://installer-exited",
+                    serde_json::json!({
+                        "sessionId": sid,
+                        "exitCode": exit_code,
+                    }),
+                );
+            })),
+        );
+
+        let mut sess = match started {
+            Ok(s) => s,
+            Err(e) => {
+                // Roll back kernel ETW session immediately on launch failure so no orphan session leaks.
+                let _ = state
+                    .elevation
+                    .execute(WorkerRequest::CancelEtwTrack { session_id });
+                return Err(e.to_string());
+            }
+        };
+
+        // 3. Bind installer root PID immediately so pre-buffered startup events replay cleanly.
+        if let Some(pid) = sess.installer_pid {
+            if let Ok(val) = state.elevation.execute(WorkerRequest::BindEtwRootPid {
+                session_id: sess.session_id.clone(),
+                root_pid: pid,
+            }) {
+                if let Ok(stats) = serde_json::from_value::<EtwSessionStats>(val) {
+                    sess.tracked_pid_count = stats.tracked_pid_count;
+                    sess.captured_file_count = stats.captured_file_count;
+                    sess.captured_reg_count = stats.captured_reg_count;
+                    state.tracker.update_etw_stats(
+                        &sess.session_id,
+                        stats.etw_active,
+                        stats.tracked_pid_count,
+                        stats.captured_file_count,
+                        stats.captured_reg_count,
+                    );
+                }
+            }
+        }
+
+        return Ok(sess);
+    }
+
     state
         .tracker
-        .start_session(
+        .start_session_with_mode(
+            None,
             &app_name,
             &installer_path,
             launch_installer,
             &roots,
+            TrackMode::HybridSnapshot,
+            false,
             Some(Box::new(move |session_id, exit_code| {
                 let _ = handle.emit(
                     "tracker://installer-exited",
@@ -468,17 +562,60 @@ pub async fn start_install_track(
 }
 
 #[tauri::command]
+pub async fn poll_install_track_stats(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<EtwSessionStats>, String> {
+    if !state.tracker.session_uses_etw(&session_id) {
+        return Ok(None);
+    }
+    let val = state
+        .elevation
+        .execute(WorkerRequest::PollEtwTrackStats {
+            session_id: session_id.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+    let stats: Option<EtwSessionStats> = serde_json::from_value(val).map_err(|e| e.to_string())?;
+    if let Some(ref s) = stats {
+        state.tracker.update_etw_stats(
+            &session_id,
+            s.etw_active,
+            s.tracked_pid_count,
+            s.captured_file_count,
+            s.captured_reg_count,
+        );
+    }
+    Ok(stats)
+}
+
+#[tauri::command]
 pub async fn finish_install_track(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<InstallTrace, String> {
     let storage = state.current_storage();
+    let etw_capture = if state.tracker.session_uses_etw(&session_id) {
+        match state.elevation.execute(WorkerRequest::StopEtwTrack {
+            session_id: session_id.clone(),
+        }) {
+            Ok(val) => serde_json::from_value::<EtwCaptureResult>(val).ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let trace = state
         .tracker
-        .finish_session(&session_id, &storage.traces_dir())
+        .finish_session_with_etw(&session_id, &storage.traces_dir(), etw_capture)
         .map_err(|e| e.to_string())?;
+    let mode_tag = match trace.track_mode {
+        TrackMode::EtwRealtime => "ETW",
+        TrackMode::HybridSnapshot => "Snapshot",
+    };
     let summary = format!(
-        "Recorded {} dirs, {} files, {} reg keys, {} reg values, {} services, {} tasks",
+        "[{}] Recorded {} dirs, {} files, {} reg keys, {} reg values, {} services, {} tasks",
+        mode_tag,
         trace.added_dirs.len(),
         trace.added_files.len(),
         trace.added_registry_keys.len(),
@@ -492,6 +629,11 @@ pub async fn finish_install_track(
 
 #[tauri::command]
 pub fn cancel_install_track(state: State<'_, AppState>, session_id: String) -> bool {
+    if state.tracker.session_uses_etw(&session_id) {
+        let _ = state.elevation.execute(WorkerRequest::CancelEtwTrack {
+            session_id: session_id.clone(),
+        });
+    }
     state.tracker.cancel_session(&session_id)
 }
 
@@ -715,4 +857,119 @@ pub fn take_pending_cli_action(state: State<'_, AppState>) -> Option<CliAction> 
         .lock()
         .ok()
         .and_then(|mut g| g.take())
+}
+
+#[tauri::command]
+pub async fn list_portable_apps(
+    state: State<'_, AppState>,
+    roots: Vec<String>,
+) -> Result<Vec<PortableApp>, String> {
+    let apps = tauri::async_runtime::spawn_blocking(move || core_scan_portable_apps(&roots))
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Ok(mut guard) = state.portable_cache.lock() {
+        *guard = apps.clone();
+    }
+    Ok(apps)
+}
+
+#[tauri::command]
+pub async fn get_portable_app_icons(
+    state: State<'_, AppState>,
+    app_ids: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    let targets: Vec<PortableApp> = {
+        let guard = state.portable_cache.lock().map_err(|e| e.to_string())?;
+        let id_set: std::collections::HashSet<&str> = app_ids.iter().map(|s| s.as_str()).collect();
+        guard
+            .iter()
+            .filter(|a| id_set.contains(a.id.as_str()))
+            .cloned()
+            .collect()
+    };
+
+    let pairs: Vec<(String, Option<String>)> = targets
+        .par_iter()
+        .map(|app| {
+            let uri = state
+                .icon_cache
+                .get_or_extract_for_path(&app.id, Path::new(&app.exe_path));
+            (app.id.clone(), uri)
+        })
+        .collect();
+
+    let mut out = HashMap::with_capacity(pairs.len());
+    for (id, uri_opt) in pairs {
+        if let Some(uri) = uri_opt {
+            out.insert(id, uri);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn launch_portable_app(exe_path: String, working_dir: String) -> Result<(), String> {
+    core_launch_portable_app(Path::new(&exe_path), Path::new(&working_dir))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn create_portable_shortcut(
+    state: State<'_, AppState>,
+    exe_path: String,
+    name: String,
+    location: ShortcutLocation,
+) -> Result<String, String> {
+    let storage = state.current_storage();
+    let res = core_create_portable_shortcut(Path::new(&exe_path), &name, location);
+    let loc_str = match location {
+        ShortcutLocation::Desktop => "Desktop",
+        ShortcutLocation::StartMenu => "Start Menu",
+    };
+    let _ = storage.append_log(
+        "portable_shortcut",
+        &name,
+        &format!("Created {} shortcut", loc_str),
+        res.is_ok(),
+    );
+    res.map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn check_winget_updates(
+    state: State<'_, AppState>,
+) -> Result<WingetCheckResult, String> {
+    let apps_snapshot: Vec<InstalledApp> = {
+        let guard = state.apps_cache.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || core_check_winget_updates(&apps_snapshot))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn run_winget_upgrade(
+    state: State<'_, AppState>,
+    package_id: String,
+    app_name: String,
+) -> Result<WingetUpgradeResult, String> {
+    let storage = state.current_storage();
+    let pid_clone = package_id.clone();
+    let name_clone = app_name.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        core_run_winget_upgrade(&pid_clone, &name_clone)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let _ = storage.append_log(
+        "winget_upgrade",
+        &app_name,
+        &format!("{} -> {}", package_id, res.message),
+        res.success,
+    );
+    Ok(res)
 }

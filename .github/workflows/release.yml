@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.3.0; defaults to v<version> from Cargo.toml)'
+        description: 'Release tag (e.g. v0.5.0; defaults to v<version> from Cargo.toml)'
         required: false
         type: string
 
@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -55,14 +55,14 @@ jobs:
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 11
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
 
       - name: Setup Rust toolchain
@@ -77,6 +77,23 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify pure ASCII source files
+        run: |
+          $nonAscii = @()
+          Get-ChildItem -Recurse -File -Include *.rs,*.ts,*.tsx | Where-Object {
+            $_.FullName -notmatch '\\(target|node_modules|dist|\.git)\\'
+          } | ForEach-Object {
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            if ($bytes | Where-Object { $_ -gt 127 }) {
+              $nonAscii += $_.FullName
+            }
+          }
+          if ($nonAscii.Count -gt 0) {
+            Write-Error ("Non-ASCII characters found in: " + ($nonAscii -join ", "))
+            exit 1
+          }
+          Write-Host "OK: all *.rs, *.ts, *.tsx source files are pure ASCII"
 
       - name: Run quality gates
         run: |
@@ -119,6 +136,9 @@ jobs:
           Copy-Item 'target/release/unbind.exe' (Join-Path $stageDir 'unbind.exe')
           Copy-Item 'LICENSE' (Join-Path $stageDir 'LICENSE')
           Copy-Item 'README.md' (Join-Path $stageDir 'README.md')
+          if (Test-Path 'README.zh-CN.md') {
+            Copy-Item 'README.zh-CN.md' (Join-Path $stageDir 'README.zh-CN.md')
+          }
           $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
           [System.IO.File]::WriteAllText(
             (Join-Path (Resolve-Path $stageDir).Path 'portable.json'),

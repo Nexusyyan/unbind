@@ -17,6 +17,7 @@ interface StartupManagerViewProps {
   dict: Dict;
   items: StartupItem[];
   loading: boolean;
+  embedded?: boolean;
   onRefresh: () => void;
   onNotify: (kind: "info" | "success" | "warning" | "error", title: string, detail?: string) => void;
 }
@@ -46,6 +47,7 @@ export function StartupManagerView({
   dict,
   items,
   loading,
+  embedded = false,
   onRefresh,
   onNotify,
 }: StartupManagerViewProps) {
@@ -125,31 +127,33 @@ export function StartupManagerView({
   ];
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col bg-[var(--bg-canvas)]">
+    <div className="flex min-h-0 flex-1 flex-col bg-[var(--bg-canvas)]">
       {/* Header & Controls */}
-      <div className="space-y-3 px-6 pt-5 pb-2.5">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h1 className="text-[17px] font-medium tracking-[-0.015em] text-[var(--text-primary)]">
-              {dict.startup.title}
-            </h1>
-            <p className="mt-0.5 text-[12.5px] text-[var(--text-secondary)]">
-              {dict.startup.subtitle}
-            </p>
+      <div className={`space-y-3 px-6 pb-2.5 ${embedded ? "pt-3" : "pt-5"}`}>
+        {!embedded && (
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h1 className="text-[17px] font-medium tracking-[-0.015em] text-[var(--text-primary)]">
+                {dict.startup.title}
+              </h1>
+              <p className="mt-0.5 text-[12.5px] text-[var(--text-secondary)]">
+                {dict.startup.subtitle}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onRefresh}
+              disabled={loading}
+              className="ui-btn-ghost h-8 px-2.5"
+            >
+              <RefreshCw
+                className={`h-[14px] w-[14px] text-[var(--text-tertiary)] ${loading ? "animate-spin" : ""}`}
+                strokeWidth={1.5}
+              />
+              <span>{dict.toolbar.refresh}</span>
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={onRefresh}
-            disabled={loading}
-            className="ui-btn-ghost h-8 px-2.5"
-          >
-            <RefreshCw
-              className={`h-[14px] w-[14px] text-[var(--text-tertiary)] ${loading ? "animate-spin" : ""}`}
-              strokeWidth={1.5}
-            />
-            <span>{dict.toolbar.refresh}</span>
-          </button>
-        </div>
+        )}
 
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="ui-search-float relative flex h-9 min-w-[240px] max-w-md flex-1 items-center">
@@ -198,6 +202,21 @@ export function StartupManagerView({
             <span className="num-tabular ml-2 text-[12px] text-[var(--text-tertiary)]">
               {visible.length}
             </span>
+            {embedded && (
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={loading}
+                aria-label={dict.toolbar.refresh}
+                title={dict.toolbar.refresh}
+                className="ui-btn-ghost ml-1 h-7.5 w-7.5 p-0"
+              >
+                <RefreshCw
+                  className={`h-[14px] w-[14px] text-[var(--text-tertiary)] ${loading ? "animate-spin" : ""}`}
+                  strokeWidth={1.5}
+                />
+              </button>
+            )}
           </div>
         </div>
       </div>

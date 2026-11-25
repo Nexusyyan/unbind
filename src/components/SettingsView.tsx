@@ -17,6 +17,7 @@ import type {
   AppSettings,
   ShellIntegrationStatus,
   SystemStatus,
+  TrackMode,
   UpdateCheckResult,
 } from "../types";
 import { BrandLogo } from "./BrandLogo";
@@ -96,6 +97,19 @@ export function SettingsView({
     await updateSettings({ customTrackRoots: current.filter((r) => r !== root) });
   };
 
+  const handleAddPortableRoot = async () => {
+    const picked = await api.pickFolder();
+    if (!picked) return;
+    const current = settings.portableAppRoots ?? [];
+    if (current.some((r) => r.toLowerCase() === picked.toLowerCase())) return;
+    await updateSettings({ portableAppRoots: [...current, picked] });
+  };
+
+  const handleRemovePortableRoot = async (root: string) => {
+    const current = settings.portableAppRoots ?? [];
+    await updateSettings({ portableAppRoots: current.filter((r) => r !== root) });
+  };
+
   const handleCheckUpdates = async () => {
     setCheckingUpdate(true);
     try {
@@ -121,6 +135,8 @@ export function SettingsView({
   ];
 
   const trackRoots = settings.customTrackRoots ?? [];
+  const portableRoots = settings.portableAppRoots ?? [];
+  const defaultTrackMode: TrackMode = settings.defaultTrackMode ?? "hybridSnapshot";
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto bg-[var(--bg-canvas)] px-6 pt-5 pb-10">
@@ -251,8 +267,40 @@ export function SettingsView({
           </div>
         </section>
 
-        {/* Install Tracker Default Extra Folders */}
-        <section className="ui-card space-y-3 p-5">
+        {/* Install Tracker Default Engine & Extra Folders */}
+        <section className="ui-card space-y-3.5 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
+              {dict.settings.defaultTrackModeLabel}
+            </div>
+            <div className="inline-flex items-center gap-1 rounded-[10px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-1">
+              {(
+                [
+                  { id: "etwRealtime" as TrackMode, label: dict.tracker.modeEtw },
+                  { id: "hybridSnapshot" as TrackMode, label: dict.tracker.modeSnapshot },
+                ] as const
+              ).map((opt) => {
+                const active = defaultTrackMode === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => void updateSettings({ defaultTrackMode: opt.id })}
+                    className={`rounded-[7px] px-2.5 py-1 text-[12px] transition-colors duration-150 cursor-pointer ${
+                      active
+                        ? "bg-[var(--bg-surface)] font-medium text-[var(--text-primary)] shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
+                        : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="h-px bg-[var(--border-hairline)]" />
+
           <div className="flex items-start justify-between gap-3">
             <div>
               <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
@@ -286,6 +334,51 @@ export function SettingsView({
                   <button
                     type="button"
                     onClick={() => void handleRemoveTrackRoot(root)}
+                    className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)] cursor-pointer"
+                  >
+                    <X className="h-3 w-3" strokeWidth={1.5} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Portable Software Library Folders */}
+        <section className="ui-card space-y-3 p-5">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
+                {dict.settings.portableRootsTitle}
+              </div>
+              <p className="mt-0.5 text-[12px] text-[var(--text-secondary)]">
+                {dict.settings.portableRootsDesc}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleAddPortableRoot}
+              className="ui-btn-secondary h-7.5 shrink-0 px-2.5 text-[12px]"
+            >
+              <FolderPlus className="h-3.5 w-3.5 text-[var(--text-tertiary)]" strokeWidth={1.5} />
+              <span>{dict.portable.addRoot}</span>
+            </button>
+          </div>
+          {portableRoots.length === 0 ? (
+            <div className="rounded-[10px] bg-[var(--bg-subtle)] px-3.5 py-2.5 text-[12px] text-[var(--text-tertiary)]">
+              {dict.settings.portableRootsEmpty}
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {portableRoots.map((root) => (
+                <span
+                  key={root}
+                  className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-2.5 py-1 font-mono text-[11.5px] text-[var(--text-primary)]"
+                >
+                  <span>{root}</span>
+                  <button
+                    type="button"
+                    onClick={() => void handleRemovePortableRoot(root)}
                     className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)] cursor-pointer"
                   >
                     <X className="h-3 w-3" strokeWidth={1.5} />
@@ -399,7 +492,7 @@ export function SettingsView({
           <div className="pt-0.5">
             {dict.settings.versionLabel}{" "}
             <span className="num-tabular font-mono text-[var(--text-primary)]">
-              v{status?.appVersion ?? "0.4.0"}
+              v{status?.appVersion ?? "0.5.0"}
             </span>{" "}
             | Tauri v2 + Rust (windows-rs) + React / TypeScript
           </div>

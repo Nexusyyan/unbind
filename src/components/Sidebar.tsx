@@ -2,9 +2,9 @@ import {
   Activity,
   ArchiveRestore,
   Layers,
-  Power,
   Settings,
   ShoppingBag,
+  Wrench,
 } from "lucide-react";
 import type { Dict } from "../i18n";
 import type { NavTab } from "../types";
@@ -17,7 +17,7 @@ interface SidebarProps {
   counts: {
     apps: number;
     store: number;
-    startup: number;
+    tools: number;
     traces: number;
     activeTracks: number;
     backups: number;
@@ -43,7 +43,7 @@ export function Sidebar({
   }> = [
     { id: "apps", label: dict.nav.apps, icon: Layers, badge: counts.apps },
     { id: "store", label: dict.nav.store, icon: ShoppingBag, badge: counts.store },
-    { id: "startup", label: dict.nav.startup, icon: Power, badge: counts.startup },
+    { id: "tools", label: dict.nav.tools, icon: Wrench, badge: counts.tools },
     {
       id: "tracker",
       label: dict.nav.tracker,

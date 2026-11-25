@@ -1,8 +1,10 @@
 pub mod discovery;
+pub mod etw_tracker;
 pub mod export;
 pub mod ipc;
 pub mod models;
 pub mod portable;
+pub mod portable_apps;
 pub mod safety;
 pub mod shell_ext;
 pub mod startup;
@@ -10,6 +12,7 @@ pub mod tracker;
 pub mod uninstaller;
 pub mod unlocker;
 pub mod updater;
+pub mod winget;
 
 /// Read a friendly Windows version string (e.g. "Windows 11 Pro (Build 26200)") from registry.
 pub fn get_windows_version_string() -> String {

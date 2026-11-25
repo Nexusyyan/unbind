@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowDownUp,
   ArrowUp,
+  ArrowUpCircle,
   Check,
   CheckSquare,
   ChevronDown,
@@ -13,6 +14,7 @@ import {
   FolderOpen,
   Hammer,
   KeyRound,
+  Loader2,
   Lock,
   Package,
   RefreshCw,
@@ -32,6 +34,7 @@ import type {
   ExportFormat,
   InstalledApp,
   PackageManagerKind,
+  WingetUpdateInfo,
 } from "../types";
 import { computeFilterCounts, filterAndSortApps, formatSizeKb } from "../utils/format";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -46,6 +49,16 @@ interface AppListViewProps {
   onChangeViewState: (updater: (prev: AppListViewState) => AppListViewState) => void;
   icons: Record<string, string>;
   onRequestIcons: (ids: string[]) => void;
+  wingetUpdates: Record<string, WingetUpdateInfo>;
+  wingetChecked: boolean;
+  checkingWinget: boolean;
+  upgradingIds: Set<string>;
+  batchUpgradingLabel: string | null;
+  onCheckWingetUpdates: () => Promise<void>;
+  onUpgradeApp: (app: InstalledApp, update: WingetUpdateInfo) => Promise<void>;
+  onUpgradeAllApps: (
+    targets: Array<{ app: InstalledApp; update: WingetUpdateInfo }>,
+  ) => Promise<void>;
   onRefresh: () => void;
   onUninstall: (app: InstalledApp, quiet: boolean) => void;
   onForceUninstall: (app?: InstalledApp) => void;
@@ -79,6 +92,14 @@ export function AppListView({
   onChangeViewState,
   icons,
   onRequestIcons,
+  wingetUpdates,
+  wingetChecked,
+  checkingWinget,
+  upgradingIds,
+  batchUpgradingLabel,
+  onCheckWingetUpdates,
+  onUpgradeApp,
+  onUpgradeAllApps,
   onRefresh,
   onUninstall,
   onForceUninstall,
@@ -99,6 +120,11 @@ export function AppListView({
   const [sortOpen, setSortOpen] = useState(false);
   const [confirmCleanBroken, setConfirmCleanBroken] = useState(false);
   const [cleaningBroken, setCleaningBroken] = useState(false);
+  const [pendingUpgrade, setPendingUpgrade] = useState<{
+    app: InstalledApp;
+    update: WingetUpdateInfo;
+  } | null>(null);
+  const [confirmBatchUpgrade, setConfirmBatchUpgrade] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -127,6 +153,11 @@ export function AppListView({
     });
   };
 
+  const updatableAppIds = useMemo(
+    () => new Set(Object.keys(wingetUpdates)),
+    [wingetUpdates],
+  );
+
   const visibleApps = useMemo(
     () =>
       filterAndSortApps(apps, {
@@ -137,8 +168,9 @@ export function AppListView({
         sortDesc,
         showSystemComponents: settings.showSystemComponents,
         showWindowsUpdates: settings.showWindowsUpdates,
+        updatableAppIds,
       }),
-    [apps, storeOnly, query, filterMode, sortField, sortDesc, settings],
+    [apps, storeOnly, query, filterMode, sortField, sortDesc, settings, updatableAppIds],
   );
 
   const filterCounts = useMemo(
@@ -148,9 +180,20 @@ export function AppListView({
         query,
         showSystemComponents: settings.showSystemComponents,
         showWindowsUpdates: settings.showWindowsUpdates,
+        updatableAppIds,
       }),
-    [apps, storeOnly, query, settings],
+    [apps, storeOnly, query, settings, updatableAppIds],
   );
+
+  const matchedUpdatables = useMemo(() => {
+    const list: Array<{ app: InstalledApp; update: WingetUpdateInfo }> = [];
+    for (const app of apps) {
+      if (app.kind === "storeApp") continue;
+      const upd = wingetUpdates[app.id];
+      if (upd) list.push({ app, update: upd });
+    }
+    return list;
+  }, [apps, wingetUpdates]);
 
   const maxSizeKb = useMemo(
     () => Math.max(1, ...visibleApps.map((a) => a.estimatedSizeKb)),
@@ -344,6 +387,9 @@ export function AppListView({
       ]
     : [
         { id: "all", label: dict.toolbar.filterAll, count: filterCounts.all },
+        ...(wingetChecked || filterCounts.updatable > 0
+          ? [{ id: "updatable" as AppFilterMode, label: dict.toolbar.filterUpdatable, count: filterCounts.updatable }]
+          : []),
         { id: "recent", label: dict.toolbar.filterRecent, count: filterCounts.recent },
         { id: "large", label: dict.toolbar.filterLarge, count: filterCounts.large },
         { id: "broken", label: dict.toolbar.filterBroken, count: filterCounts.broken },
@@ -412,6 +458,30 @@ export function AppListView({
               />
               <span>{dict.toolbar.refresh}</span>
             </button>
+
+            {!storeOnly && (
+              <button
+                type="button"
+                onClick={() => void onCheckWingetUpdates()}
+                disabled={checkingWinget || Boolean(batchUpgradingLabel)}
+                className="ui-btn-ghost h-8 px-2.5"
+              >
+                {checkingWinget ? (
+                  <Loader2
+                    className="h-[14px] w-[14px] animate-spin text-[var(--text-tertiary)]"
+                    strokeWidth={1.5}
+                  />
+                ) : (
+                  <ArrowUpCircle
+                    className="h-[14px] w-[14px] text-[var(--text-tertiary)]"
+                    strokeWidth={1.5}
+                  />
+                )}
+                <span>
+                  {checkingWinget ? dict.toolbar.checkingUpdates : dict.toolbar.checkUpdates}
+                </span>
+              </button>
+            )}
 
             {!storeOnly && (
               <button
@@ -519,6 +589,27 @@ export function AppListView({
                 <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />
                 <span>{dict.toolbar.cleanAllBroken}</span>
               </button>
+            )}
+
+            {!storeOnly &&
+              filterMode === "updatable" &&
+              matchedUpdatables.length > 0 &&
+              !batchUpgradingLabel && (
+                <button
+                  type="button"
+                  onClick={() => setConfirmBatchUpgrade(true)}
+                  className="ui-btn-primary ml-1.5 h-7 px-2.5 text-[11.5px]"
+                >
+                  <ArrowUpCircle className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  <span>{dict.toolbar.upgradeAll}</span>
+                </button>
+              )}
+
+            {batchUpgradingLabel && (
+              <span className="ml-2 inline-flex items-center gap-1.5 rounded-full bg-[var(--bg-subtle)] px-2.5 py-0.5 text-[11.5px] text-[var(--text-secondary)]">
+                <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.5} />
+                <span className="truncate max-w-[260px]">{batchUpgradingLabel}</span>
+              </span>
             )}
           </div>
 
@@ -806,13 +897,25 @@ export function AppListView({
                         </div>
                       </div>
 
-                      {/* Version */}
-                      <div
-                        className={`num-tabular truncate text-[12px] ${
-                          app.version ? "text-[var(--text-secondary)]" : "text-[var(--text-tertiary)]"
-                        }`}
-                      >
-                        {app.version || "-"}
+                      {/* Version (+ Subtle Winget Update Indicator) */}
+                      <div className="min-w-0">
+                        <div
+                          className={`num-tabular truncate text-[12px] ${
+                            app.version
+                              ? "text-[var(--text-secondary)]"
+                              : "text-[var(--text-tertiary)]"
+                          }`}
+                        >
+                          {app.version || "-"}
+                        </div>
+                        {wingetUpdates[app.id] && (
+                          <div
+                            title={`${wingetUpdates[app.id].packageId}: ${wingetUpdates[app.id].currentVersion} -> ${wingetUpdates[app.id].availableVersion}`}
+                            className="num-tabular mt-0.5 truncate text-[10.5px] font-medium text-[var(--success-text)]"
+                          >
+                            -&gt; {wingetUpdates[app.id].availableVersion}
+                          </div>
+                        )}
                       </div>
 
                       {/* Install Date */}
@@ -921,7 +1024,45 @@ export function AppListView({
             </div>
 
             {/* Action Buttons */}
-            <div className="mt-5 grid grid-cols-2 gap-2">
+            {wingetUpdates[selectedApp.id] && (
+              <div className="mt-4 rounded-[12px] border border-[var(--success-border)] bg-[var(--success-bg)] p-3">
+                <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-[var(--success-text)]">
+                  <span>{dict.winget.availableVersion}</span>
+                  <span className="num-tabular font-mono">
+                    {wingetUpdates[selectedApp.id].availableVersion}
+                  </span>
+                </div>
+                <div className="mt-1 truncate font-mono text-[10.5px] text-[var(--text-secondary)]">
+                  {wingetUpdates[selectedApp.id].packageId}
+                </div>
+                <button
+                  type="button"
+                  disabled={
+                    upgradingIds.has(selectedApp.id) || Boolean(batchUpgradingLabel)
+                  }
+                  onClick={() =>
+                    setPendingUpgrade({
+                      app: selectedApp,
+                      update: wingetUpdates[selectedApp.id],
+                    })
+                  }
+                  className="ui-btn-primary mt-2.5 h-7.5 w-full text-[12px]"
+                >
+                  {upgradingIds.has(selectedApp.id) ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                  ) : (
+                    <ArrowUpCircle className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  )}
+                  <span>
+                    {upgradingIds.has(selectedApp.id)
+                      ? dict.winget.upgrading
+                      : dict.winget.upgradeAction}
+                  </span>
+                </button>
+              </div>
+            )}
+
+            <div className="mt-4 grid grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => onUninstall(selectedApp, false)}
@@ -1172,6 +1313,38 @@ export function AppListView({
             } finally {
               setCleaningBroken(false);
             }
+          }}
+        />
+      )}
+
+      {pendingUpgrade && (
+        <ConfirmDialog
+          title={dict.winget.confirmTitle}
+          description={dict.winget.confirmDesc}
+          detail={`${pendingUpgrade.app.name} (${pendingUpgrade.update.packageId})\n${pendingUpgrade.update.currentVersion} -> ${pendingUpgrade.update.availableVersion}`}
+          confirmLabel={dict.winget.upgradeAction}
+          cancelLabel={dict.common.cancel}
+          busy={upgradingIds.has(pendingUpgrade.app.id)}
+          onCancel={() => setPendingUpgrade(null)}
+          onConfirm={async () => {
+            const target = pendingUpgrade;
+            setPendingUpgrade(null);
+            await onUpgradeApp(target.app, target.update);
+          }}
+        />
+      )}
+
+      {confirmBatchUpgrade && (
+        <ConfirmDialog
+          title={dict.winget.confirmBatchTitle}
+          description={dict.winget.confirmBatchDesc}
+          detail={`${matchedUpdatables.length} ${dict.status.programs}`}
+          confirmLabel={dict.toolbar.upgradeAll}
+          cancelLabel={dict.common.cancel}
+          onCancel={() => setConfirmBatchUpgrade(false)}
+          onConfirm={() => {
+            setConfirmBatchUpgrade(false);
+            void onUpgradeAllApps(matchedUpdatables);
           }}
         />
       )}

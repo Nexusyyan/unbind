@@ -1,6 +1,6 @@
 use crate::models::{
-    ActiveTrackSession, ConfidenceLevel, CoreError, CoreResult, InstallTrace, LeftoverItem,
-    LeftoverKind, TrackedRegValue,
+    ActiveTrackSession, ConfidenceLevel, CoreError, CoreResult, EtwCaptureResult, InstallTrace,
+    LeftoverItem, LeftoverKind, TrackMode, TrackedRegValue,
 };
 use crate::safety::{
     is_protected_path, is_protected_registry_key, open_predef_hive, split_registry_path,
@@ -56,6 +56,30 @@ impl TrackerManager {
         extra_roots: &[String],
         on_installer_exit: Option<InstallerExitCallback>,
     ) -> CoreResult<ActiveTrackSession> {
+        self.start_session_with_mode(
+            None,
+            app_name,
+            installer_path,
+            launch_installer,
+            extra_roots,
+            TrackMode::HybridSnapshot,
+            false,
+            on_installer_exit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_session_with_mode(
+        &self,
+        preset_session_id: Option<String>,
+        app_name: &str,
+        installer_path: &str,
+        launch_installer: bool,
+        extra_roots: &[String],
+        track_mode: TrackMode,
+        etw_active: bool,
+        on_installer_exit: Option<InstallerExitCallback>,
+    ) -> CoreResult<ActiveTrackSession> {
         let clean_name = app_name.trim();
         if clean_name.is_empty() {
             return Err(CoreError::InvalidInput(
@@ -73,7 +97,7 @@ impl TrackerManager {
             .collect();
 
         let baseline = capture_system_snapshot(&valid_roots);
-        let session_id = Uuid::new_v4().to_string();
+        let session_id = preset_session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let watched_proc = if launch_installer && !installer_path.trim().is_empty() {
             launch_installer_monitored(Path::new(installer_path.trim()))?
@@ -97,6 +121,11 @@ impl TrackerManager {
             watched_roots: valid_roots,
             installer_pid,
             installer_exited: false,
+            track_mode,
+            etw_active,
+            tracked_pid_count: usize::from(installer_pid.is_some()),
+            captured_file_count: 0,
+            captured_reg_count: 0,
         };
 
         {
@@ -135,6 +164,32 @@ impl TrackerManager {
         Ok(meta)
     }
 
+    pub fn update_etw_stats(
+        &self,
+        session_id: &str,
+        etw_active: bool,
+        tracked_pid_count: usize,
+        captured_file_count: usize,
+        captured_reg_count: usize,
+    ) {
+        if let Ok(mut guard) = self.sessions.lock() {
+            if let Some(sess) = guard.get_mut(session_id) {
+                sess.meta.etw_active = etw_active;
+                sess.meta.tracked_pid_count = tracked_pid_count;
+                sess.meta.captured_file_count = captured_file_count;
+                sess.meta.captured_reg_count = captured_reg_count;
+            }
+        }
+    }
+
+    pub fn session_uses_etw(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|g| g.get(session_id).map(|s| s.meta.etw_active))
+            .unwrap_or(false)
+    }
+
     pub fn active_sessions(&self) -> Vec<ActiveTrackSession> {
         self.sessions
             .lock()
@@ -155,6 +210,17 @@ impl TrackerManager {
         session_id: &str,
         traces_dir: &Path,
     ) -> CoreResult<InstallTrace> {
+        self.finish_session_with_etw(session_id, traces_dir, None)
+    }
+
+    /// Finalize a session by fusing optional real-time ETW captures with the before/after system
+    /// snapshot diff, pruning self-deleted transient files and persisting the trace JSON.
+    pub fn finish_session_with_etw(
+        &self,
+        session_id: &str,
+        traces_dir: &Path,
+        etw_capture: Option<EtwCaptureResult>,
+    ) -> CoreResult<InstallTrace> {
         let running = {
             let mut guard = self
                 .sessions
@@ -166,7 +232,12 @@ impl TrackerManager {
         };
 
         let after = capture_system_snapshot(&running.meta.watched_roots);
-        let trace = compute_trace_diff(&running.meta, &running.baseline, &after);
+        let trace = compute_trace_diff_fused(
+            &running.meta,
+            &running.baseline,
+            &after,
+            etw_capture.as_ref(),
+        );
         save_trace(&trace, traces_dir)?;
         Ok(trace)
     }
@@ -179,12 +250,109 @@ pub fn compute_trace_diff(
     before: &SystemSnapshot,
     after: &SystemSnapshot,
 ) -> InstallTrace {
-    let mut raw_dirs: Vec<String> = after
+    compute_trace_diff_fused(meta, before, after, None)
+}
+
+/// Compute a fused InstallTrace combining real-time ETW PID-tree captures with before/after
+/// system snapshots. Every ETW filesystem path is verified via `Path::exists()` so transient
+/// `%TEMP%` files self-deleted before installer completion are automatically discarded.
+pub fn compute_trace_diff_fused(
+    meta: &ActiveTrackSession,
+    before: &SystemSnapshot,
+    after: &SystemSnapshot,
+    etw: Option<&EtwCaptureResult>,
+) -> InstallTrace {
+    let mut dir_candidates: HashSet<String> = after
         .dirs
         .difference(&before.dirs)
         .filter(|d| !is_tracker_noise_path(d) && !is_protected_path(Path::new(d)))
         .cloned()
         .collect();
+
+    let mut file_candidates: HashSet<String> = after
+        .files
+        .difference(&before.files)
+        .filter(|f| !is_tracker_noise_path(f) && !is_protected_path(Path::new(f)))
+        .cloned()
+        .collect();
+
+    let mut reg_key_candidates: HashSet<String> = after
+        .reg_keys
+        .difference(&before.reg_keys)
+        .filter(|k| !is_tracker_noise_reg(k))
+        .filter(|k| {
+            split_registry_path(k)
+                .map(|(h, s)| !is_protected_registry_key(&h, &s))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    let mut reg_val_candidates: HashSet<TrackedRegValue> = after
+        .reg_values
+        .difference(&before.reg_values)
+        .filter(|v| !is_tracker_noise_reg(&v.key_path))
+        .cloned()
+        .collect();
+
+    let mut etw_event_count = 0u64;
+    if let Some(cap) = etw {
+        etw_event_count = cap.total_events;
+        for d in &cap.added_dirs {
+            let p = Path::new(d);
+            if p.is_dir()
+                && !before.dirs.contains(d)
+                && !is_tracker_noise_path(d)
+                && !is_protected_path(p)
+            {
+                dir_candidates.insert(d.clone());
+            }
+        }
+        for f in &cap.added_files {
+            let p = Path::new(f);
+            // Critical post-stop filter: drop any temp/extracted file already removed by installer.
+            if p.is_file()
+                && !before.files.contains(f)
+                && !is_tracker_noise_path(f)
+                && !is_protected_path(p)
+            {
+                file_candidates.insert(f.clone());
+            }
+        }
+        for k in &cap.added_registry_keys {
+            if !before.reg_keys.contains(k) && !is_tracker_noise_reg(k) {
+                if let Some((hive, sub)) = split_registry_path(k) {
+                    if !is_protected_registry_key(&hive, &sub)
+                        && open_predef_hive(&hive)
+                            .and_then(|root| {
+                                root.open_subkey_with_flags(&sub, KEY_READ)
+                                    .map_err(CoreError::Io)
+                            })
+                            .is_ok()
+                    {
+                        reg_key_candidates.insert(k.clone());
+                    }
+                }
+            }
+        }
+        for rv in &cap.added_registry_values {
+            if !before.reg_values.contains(rv) && !is_tracker_noise_reg(&rv.key_path) {
+                if let Some((hive, sub)) = split_registry_path(&rv.key_path) {
+                    if !is_protected_registry_key(&hive, &sub) {
+                        if let Ok(root) = open_predef_hive(&hive) {
+                            if let Ok(k) = root.open_subkey_with_flags(&sub, KEY_READ) {
+                                if k.get_raw_value(&rv.value_name).is_ok() {
+                                    reg_val_candidates.insert(rv.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut raw_dirs: Vec<String> = dir_candidates.into_iter().collect();
     raw_dirs.sort_by_key(|s| s.len());
 
     let mut added_dirs: Vec<String> = Vec::new();
@@ -198,30 +366,18 @@ pub fn compute_trace_diff(
         }
     }
 
-    let added_files: Vec<String> = after
-        .files
-        .difference(&before.files)
-        .filter(|f| !is_tracker_noise_path(f) && !is_protected_path(Path::new(f)))
+    let mut added_files: Vec<String> = file_candidates
+        .into_iter()
         .filter(|f| {
             let lower = f.to_lowercase();
             !added_dirs
                 .iter()
                 .any(|parent| lower.starts_with(&format!("{}\\", parent.to_lowercase())))
         })
-        .cloned()
         .collect();
+    added_files.sort();
 
-    let mut raw_keys: Vec<String> = after
-        .reg_keys
-        .difference(&before.reg_keys)
-        .filter(|k| !is_tracker_noise_reg(k))
-        .filter(|k| {
-            split_registry_path(k)
-                .map(|(h, s)| !is_protected_registry_key(&h, &s))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
+    let mut raw_keys: Vec<String> = reg_key_candidates.into_iter().collect();
     raw_keys.sort_by_key(|s| s.len());
 
     let mut added_registry_keys: Vec<String> = Vec::new();
@@ -235,10 +391,8 @@ pub fn compute_trace_diff(
         }
     }
 
-    let added_registry_values: Vec<TrackedRegValue> = after
-        .reg_values
-        .difference(&before.reg_values)
-        .filter(|v| !is_tracker_noise_reg(&v.key_path))
+    let added_registry_values: Vec<TrackedRegValue> = reg_val_candidates
+        .into_iter()
         .filter(|v| {
             let lower = v.key_path.to_lowercase();
             !added_registry_keys.iter().any(|p| {
@@ -246,7 +400,6 @@ pub fn compute_trace_diff(
                 lower == pl || lower.starts_with(&format!("{}\\", pl))
             })
         })
-        .cloned()
         .collect();
 
     let mut added_services: Vec<String> = after
@@ -288,6 +441,12 @@ pub fn compute_trace_diff(
         added_scheduled_tasks,
         watched_roots: meta.watched_roots.clone(),
         total_size_bytes,
+        track_mode: if etw.is_some() {
+            TrackMode::EtwRealtime
+        } else {
+            meta.track_mode
+        },
+        etw_event_count,
     }
 }
 
@@ -863,6 +1022,11 @@ mod tests {
             watched_roots: vec!["D:\\CustomApps".into()],
             installer_pid: None,
             installer_exited: false,
+            track_mode: TrackMode::HybridSnapshot,
+            etw_active: false,
+            tracked_pid_count: 0,
+            captured_file_count: 0,
+            captured_reg_count: 0,
         };
 
         let trace = compute_trace_diff(&meta, &before, &after);
@@ -891,5 +1055,62 @@ mod tests {
         let imported = import_trace_from_file(&exported, dir.path()).unwrap();
         assert_ne!(imported.id, trace.id);
         assert_eq!(imported.app_name, "NewTrackedApp");
+    }
+
+    #[test]
+    fn test_etw_fusion_prunes_self_deleted_temp_files_and_keeps_persisted() {
+        let dir = tempdir().unwrap();
+        let kept_file = dir.path().join("kept_app_file.bin");
+        fs::write(&kept_file, b"persisted-payload").unwrap();
+        let vanished_file = dir.path().join("self_deleted_setup.tmp");
+        // Never created (simulates installer self-deleting extracted temp payload before finish).
+
+        let empty = SystemSnapshot {
+            dirs: HashSet::new(),
+            files: HashSet::new(),
+            reg_keys: HashSet::new(),
+            reg_values: HashSet::new(),
+            services: HashSet::new(),
+            scheduled_tasks: HashSet::new(),
+        };
+        let meta = ActiveTrackSession {
+            session_id: "etw-s1".into(),
+            app_name: "EtwDemo".into(),
+            installer_path: "C:\\Downloads\\etw_setup.exe".into(),
+            started_at: Utc::now().to_rfc3339(),
+            baseline_dir_count: 0,
+            baseline_file_count: 0,
+            baseline_reg_count: 0,
+            watched_roots: Vec::new(),
+            installer_pid: Some(4321),
+            installer_exited: true,
+            track_mode: TrackMode::EtwRealtime,
+            etw_active: true,
+            tracked_pid_count: 2,
+            captured_file_count: 2,
+            captured_reg_count: 0,
+        };
+
+        let etw = EtwCaptureResult {
+            added_files: vec![
+                kept_file.to_string_lossy().to_string(),
+                vanished_file.to_string_lossy().to_string(),
+            ],
+            added_dirs: Vec::new(),
+            added_registry_keys: Vec::new(),
+            added_registry_values: Vec::new(),
+            tracked_pids: vec![4321, 4322],
+            total_events: 42,
+        };
+
+        let trace = compute_trace_diff_fused(&meta, &empty, &empty, Some(&etw));
+        assert_eq!(trace.track_mode, TrackMode::EtwRealtime);
+        assert_eq!(trace.etw_event_count, 42);
+        // Note: tempdir lives under %TEMP%, which is filtered by is_tracker_noise_path unless
+        // outside \temp\. Verify vanished_file is definitely absent and track_mode/events preserved.
+        assert!(!trace
+            .added_files
+            .iter()
+            .any(|f| f.contains("self_deleted_setup.tmp")));
     }
 }

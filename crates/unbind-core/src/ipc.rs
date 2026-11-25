@@ -1,4 +1,5 @@
 use crate::discovery::appx::remove_appx_package;
+use crate::etw_tracker::EtwTrackerManager;
 use crate::models::{
     CleanupOptions, CoreError, CoreResult, InstalledApp, LeftoverItem, StartupItem,
 };
@@ -9,6 +10,13 @@ use crate::unlocker::{find_locking_processes, terminate_processes};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+static WORKER_ETW_MANAGER: OnceLock<EtwTrackerManager> = OnceLock::new();
+
+pub fn worker_etw_manager() -> &'static EtwTrackerManager {
+    WORKER_ETW_MANAGER.get_or_init(EtwTrackerManager::new)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", content = "payload", rename_all = "camelCase")]
@@ -50,6 +58,23 @@ pub enum WorkerRequest {
     RestoreRegistryBackup {
         path: String,
     },
+    StartEtwTrack {
+        session_id: String,
+        track_msi_service: bool,
+    },
+    BindEtwRootPid {
+        session_id: String,
+        root_pid: u32,
+    },
+    PollEtwTrackStats {
+        session_id: String,
+    },
+    StopEtwTrack {
+        session_id: String,
+    },
+    CancelEtwTrack {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +111,10 @@ pub fn read_frame<R: Read>(reader: &mut R) -> CoreResult<Vec<u8>> {
 pub fn dispatch_worker_request(req: WorkerRequest) -> WorkerResponse {
     let result: CoreResult<serde_json::Value> = (|| match req {
         WorkerRequest::Auth { .. } | WorkerRequest::Ping => Ok(serde_json::json!({ "pong": true })),
-        WorkerRequest::Shutdown => Ok(serde_json::json!({ "bye": true })),
+        WorkerRequest::Shutdown => {
+            worker_etw_manager().stop_all_sessions();
+            Ok(serde_json::json!({ "bye": true }))
+        }
         WorkerRequest::UninstallApp { app, quiet } => {
             let res = run_native_uninstaller(&app, quiet)?;
             Ok(serde_json::to_value(res)?)
@@ -129,6 +157,32 @@ pub fn dispatch_worker_request(req: WorkerRequest) -> WorkerResponse {
             restore_registry_backup(Path::new(&path))?;
             Ok(serde_json::json!({ "restored": true }))
         }
+        WorkerRequest::StartEtwTrack {
+            session_id,
+            track_msi_service,
+        } => {
+            let stats = worker_etw_manager().start_session(&session_id, track_msi_service)?;
+            Ok(serde_json::to_value(stats)?)
+        }
+        WorkerRequest::BindEtwRootPid {
+            session_id,
+            root_pid,
+        } => {
+            let stats = worker_etw_manager().bind_root_pid(&session_id, root_pid)?;
+            Ok(serde_json::to_value(stats)?)
+        }
+        WorkerRequest::PollEtwTrackStats { session_id } => {
+            let stats = worker_etw_manager().poll_stats(&session_id);
+            Ok(serde_json::to_value(stats)?)
+        }
+        WorkerRequest::StopEtwTrack { session_id } => {
+            let capture = worker_etw_manager().stop_session(&session_id)?;
+            Ok(serde_json::to_value(capture)?)
+        }
+        WorkerRequest::CancelEtwTrack { session_id } => {
+            let stopped = worker_etw_manager().cancel_session(&session_id);
+            Ok(serde_json::json!({ "cancelled": stopped }))
+        }
     })();
 
     match result {
@@ -149,6 +203,8 @@ pub fn run_elevated_worker(pipe_name: &str, token: &str, parent_pid: u32) -> Cor
     if parent_pid > 4 {
         std::thread::spawn(move || {
             watch_parent_exit(parent_pid);
+            // Always clean up any active ETW sessions before terminating the worker.
+            worker_etw_manager().stop_all_sessions();
             std::process::exit(0);
         });
     }
@@ -204,6 +260,7 @@ pub fn run_elevated_worker(pipe_name: &str, token: &str, parent_pid: u32) -> Cor
         }
     }
 
+    worker_etw_manager().stop_all_sessions();
     Ok(())
 }
 

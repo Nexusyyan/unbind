@@ -10,9 +10,9 @@ import { ForceUninstallModal } from "./components/ForceUninstallModal";
 import { InstallTrackerView } from "./components/InstallTrackerView";
 import { SettingsView } from "./components/SettingsView";
 import { Sidebar } from "./components/Sidebar";
-import { StartupManagerView } from "./components/StartupManagerView";
 import { TitleBar } from "./components/TitleBar";
 import { ToastContainer } from "./components/ToastContainer";
+import { ToolsView } from "./components/ToolsView";
 import { UninstallWizardModal } from "./components/UninstallWizardModal";
 import { getDict, resolveLocale } from "./i18n";
 import type {
@@ -28,9 +28,12 @@ import type {
   LeftoverItem,
   NavTab,
   OperationLogEntry,
+  PortableApp,
   StartupItem,
   SystemStatus,
   ToastMessage,
+  ToolsSubTab,
+  WingetUpdateInfo,
 } from "./types";
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -44,6 +47,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   language: "auto",
   theme: "system",
   customTrackRoots: [],
+  portableAppRoots: [],
+  defaultTrackMode: "hybridSnapshot",
 };
 
 const DEFAULT_LIST_STATE: AppListViewState = {
@@ -74,6 +79,17 @@ export function App() {
 
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
   const [startupLoading, setStartupLoading] = useState(false);
+
+  const [toolsSubTab, setToolsSubTab] = useState<ToolsSubTab>("startup");
+  const [portableApps, setPortableApps] = useState<PortableApp[]>([]);
+  const [portableLoading, setPortableLoading] = useState(false);
+  const [portableIcons, setPortableIcons] = useState<Record<string, string>>({});
+
+  const [wingetUpdates, setWingetUpdates] = useState<Record<string, WingetUpdateInfo>>({});
+  const [wingetChecked, setWingetChecked] = useState(false);
+  const [checkingWinget, setCheckingWinget] = useState(false);
+  const [upgradingIds, setUpgradingIds] = useState<Set<string>>(new Set());
+  const [batchUpgradingLabel, setBatchUpgradingLabel] = useState<string | null>(null);
 
   const [activeTracks, setActiveTracks] = useState<ActiveTrackSession[]>([]);
   const [traces, setTraces] = useState<InstallTrace[]>([]);
@@ -186,6 +202,32 @@ export function App() {
     }
   }, [notify]);
 
+  const refreshPortableApps = useCallback(async (roots: string[]) => {
+    if (!roots || roots.length === 0) {
+      setPortableApps([]);
+      setPortableIcons({});
+      return;
+    }
+    setPortableLoading(true);
+    try {
+      const list = await api.listPortableApps(roots);
+      setPortableApps(list);
+      if (list.length > 0 && isTauriRuntime()) {
+        const ids = list.map((p) => p.id);
+        void api
+          .getPortableAppIcons(ids)
+          .then((map) => setPortableIcons(map))
+          .catch(() => {});
+      } else {
+        setPortableIcons({});
+      }
+    } catch (err) {
+      notify("error", dictRef.current.portable.title, String(err));
+    } finally {
+      setPortableLoading(false);
+    }
+  }, [notify]);
+
   const refreshTracker = useCallback(async () => {
     try {
       const [active, saved] = await Promise.all([
@@ -227,10 +269,18 @@ export function App() {
       }
       void refreshApps();
       void refreshStartup();
+      void refreshPortableApps(cfg.portableAppRoots ?? []);
       void refreshTracker();
       void refreshBackupsAndLogs();
     })();
-  }, [refreshApps, refreshStartup, refreshTracker, refreshBackupsAndLogs, handleCliAction]);
+  }, [
+    refreshApps,
+    refreshStartup,
+    refreshPortableApps,
+    refreshTracker,
+    refreshBackupsAndLogs,
+    handleCliAction,
+  ]);
 
   // Listen to backend streaming events (async real sizes, installer exit, single-instance CLI)
   useEffect(() => {
@@ -334,9 +384,14 @@ export function App() {
   const handleSaveSettings = useCallback(
     async (next: AppSettings, silent = false) => {
       try {
+        const prevRootsKey = (settings.portableAppRoots ?? []).join("|");
         const saved = await api.saveSettings(next);
         setSettings(saved);
         await refreshStatus();
+        const nextRootsKey = (saved.portableAppRoots ?? []).join("|");
+        if (prevRootsKey !== nextRootsKey) {
+          void refreshPortableApps(saved.portableAppRoots ?? []);
+        }
         if (!silent) {
           notify("success", dictRef.current.settings.saved);
         }
@@ -344,7 +399,155 @@ export function App() {
         notify("error", dictRef.current.settings.title, String(err));
       }
     },
-    [notify, refreshStatus],
+    [settings.portableAppRoots, notify, refreshStatus, refreshPortableApps],
+  );
+
+  const handleAddPortableRoot = useCallback(async () => {
+    const picked = await api.pickFolder();
+    if (!picked) return;
+    const current = settings.portableAppRoots ?? [];
+    if (current.some((r) => r.toLowerCase() === picked.toLowerCase())) return;
+    await handleSaveSettings({ ...settings, portableAppRoots: [...current, picked] }, true);
+  }, [settings, handleSaveSettings]);
+
+  const handleRemovePortableRoot = useCallback(
+    async (root: string) => {
+      const current = settings.portableAppRoots ?? [];
+      await handleSaveSettings(
+        { ...settings, portableAppRoots: current.filter((r) => r !== root) },
+        true,
+      );
+    },
+    [settings, handleSaveSettings],
+  );
+
+  const handleDeepRemovePortable = useCallback(
+    async (targetPath: string) => {
+      try {
+        const [targetApp, leftovers] = await api.scanForceTarget(targetPath);
+        setWizardState({
+          app: targetApp,
+          quiet: false,
+          skipNative: true,
+          preloadedLeftovers: leftovers,
+        });
+      } catch (err) {
+        notify("error", dictRef.current.portable.deepRemove, String(err));
+      }
+    },
+    [notify],
+  );
+
+  const handleCheckWingetUpdates = useCallback(async () => {
+    setCheckingWinget(true);
+    try {
+      const res = await api.checkWingetUpdates();
+      if (!res.available) {
+        notify("warning", dictRef.current.winget.unavailableTitle, res.error ?? dictRef.current.winget.unavailableDesc);
+        return;
+      }
+      if (res.error) {
+        notify("error", dictRef.current.toolbar.checkUpdates, res.error);
+        return;
+      }
+      const mapped: Record<string, WingetUpdateInfo> = {};
+      for (const upd of res.updates) {
+        if (upd.matchedAppId) {
+          mapped[upd.matchedAppId] = upd;
+        }
+      }
+      setWingetUpdates(mapped);
+      setWingetChecked(true);
+      const count = Object.keys(mapped).length;
+      if (count === 0) {
+        notify("success", dictRef.current.winget.upToDateToast, res.wingetVersion);
+      } else {
+        notify("info", `${count} ${dictRef.current.winget.updatesFoundToast}`, res.wingetVersion);
+      }
+    } catch (err) {
+      notify("error", dictRef.current.toolbar.checkUpdates, String(err));
+    } finally {
+      setCheckingWinget(false);
+    }
+  }, [notify]);
+
+  const handleUpgradeApp = useCallback(
+    async (app: InstalledApp, update: WingetUpdateInfo) => {
+      setUpgradingIds((prev) => new Set(prev).add(app.id));
+      try {
+        const res = await api.runWingetUpgrade(update.packageId, app.name);
+        if (res.success) {
+          setWingetUpdates((prev) => {
+            const next = { ...prev };
+            delete next[app.id];
+            return next;
+          });
+          notify("success", `${dictRef.current.winget.upgradeDone}: ${app.name}`, res.message);
+          void refreshApps();
+          void refreshBackupsAndLogs();
+        } else {
+          notify("warning", `${dictRef.current.winget.upgradeFailed}: ${app.name}`, res.message);
+          void refreshBackupsAndLogs();
+        }
+      } catch (err) {
+        notify("error", `${dictRef.current.winget.upgradeFailed}: ${app.name}`, String(err));
+      } finally {
+        setUpgradingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(app.id);
+          return next;
+        });
+      }
+    },
+    [notify, refreshApps, refreshBackupsAndLogs],
+  );
+
+  const handleUpgradeAllApps = useCallback(
+    async (targets: Array<{ app: InstalledApp; update: WingetUpdateInfo }>) => {
+      if (targets.length === 0) return;
+      let okCount = 0;
+      let failCount = 0;
+      for (let i = 0; i < targets.length; i++) {
+        const { app, update } = targets[i];
+        setBatchUpgradingLabel(
+          dictRef.current.winget.batchProgress
+            .replace("{current}", String(i + 1))
+            .replace("{total}", String(targets.length))
+            .replace("{name}", app.name),
+        );
+        setUpgradingIds((prev) => new Set(prev).add(app.id));
+        try {
+          const res = await api.runWingetUpgrade(update.packageId, app.name);
+          if (res.success) {
+            okCount++;
+            setWingetUpdates((prev) => {
+              const next = { ...prev };
+              delete next[app.id];
+              return next;
+            });
+          } else {
+            failCount++;
+          }
+        } catch {
+          failCount++;
+        } finally {
+          setUpgradingIds((prev) => {
+            const next = new Set(prev);
+            next.delete(app.id);
+            return next;
+          });
+        }
+      }
+      setBatchUpgradingLabel(null);
+      notify(
+        failCount === 0 ? "success" : "warning",
+        dictRef.current.toolbar.upgradeAll,
+        `${dictRef.current.wizard.succeeded}: ${okCount}, ${dictRef.current.wizard.failed}: ${failCount}`,
+      );
+      void refreshApps();
+      void refreshBackupsAndLogs();
+    },
+    [notify, refreshApps, refreshBackupsAndLogs],
   );
 
   const handleElevate = useCallback(async () => {
@@ -463,13 +666,13 @@ export function App() {
     return {
       apps: win32Count,
       store: storeCount,
-      startup: startupItems.filter((s) => s.enabled).length,
+      tools: startupItems.filter((s) => s.enabled).length + portableApps.length,
       traces: traces.length,
       activeTracks: activeTracks.length,
       backups: backups.length,
       totalSizeKb,
     };
-  }, [apps, settings, startupItems, traces, activeTracks, backups]);
+  }, [apps, settings, startupItems, portableApps, traces, activeTracks, backups]);
 
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-[var(--bg-chrome)] text-[var(--text-primary)]">
@@ -505,6 +708,14 @@ export function App() {
               onChangeViewState={activeTab === "store" ? setStoreViewState : setAppsViewState}
               icons={icons}
               onRequestIcons={requestIcons}
+              wingetUpdates={wingetUpdates}
+              wingetChecked={wingetChecked}
+              checkingWinget={checkingWinget}
+              upgradingIds={upgradingIds}
+              batchUpgradingLabel={batchUpgradingLabel}
+              onCheckWingetUpdates={handleCheckWingetUpdates}
+              onUpgradeApp={handleUpgradeApp}
+              onUpgradeAllApps={handleUpgradeAllApps}
               onRefresh={refreshApps}
               onUninstall={(app, quiet) => setWizardState({ app, quiet })}
               onForceUninstall={(app) => {
@@ -524,12 +735,22 @@ export function App() {
             />
           )}
 
-          {activeTab === "startup" && (
-            <StartupManagerView
+          {activeTab === "tools" && (
+            <ToolsView
               dict={dict}
-              items={startupItems}
-              loading={startupLoading}
-              onRefresh={refreshStartup}
+              subTab={toolsSubTab}
+              onChangeSubTab={setToolsSubTab}
+              startupItems={startupItems}
+              startupLoading={startupLoading}
+              onRefreshStartup={refreshStartup}
+              portableRoots={settings.portableAppRoots ?? []}
+              portableApps={portableApps}
+              portableLoading={portableLoading}
+              portableIcons={portableIcons}
+              onAddPortableRoot={handleAddPortableRoot}
+              onRemovePortableRoot={handleRemovePortableRoot}
+              onRefreshPortable={() => void refreshPortableApps(settings.portableAppRoots ?? [])}
+              onDeepRemovePortable={handleDeepRemovePortable}
               onNotify={notify}
             />
           )}
@@ -540,6 +761,7 @@ export function App() {
               activeSessions={activeTracks}
               traces={traces}
               defaultExtraRoots={settings.customTrackRoots ?? []}
+              defaultTrackMode={settings.defaultTrackMode ?? "hybridSnapshot"}
               prefillInstallerPath={prefillTrackerPath}
               onConsumePrefill={() => setPrefillTrackerPath(null)}
               onRefresh={() => {
@@ -632,6 +854,7 @@ export function App() {
               void refreshApps();
               void refreshBackupsAndLogs();
               void refreshStartup();
+              void refreshPortableApps(settings.portableAppRoots ?? []);
             }
           }}
         />

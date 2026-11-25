@@ -19,7 +19,14 @@ import {
 } from "lucide-react";
 import { api } from "../api/client";
 import type { Dict } from "../i18n";
-import type { ActiveTrackSession, InstallTrace, InstalledApp, LeftoverItem } from "../types";
+import type {
+  ActiveTrackSession,
+  EtwSessionStats,
+  InstallTrace,
+  InstalledApp,
+  LeftoverItem,
+  TrackMode,
+} from "../types";
 import { formatBytes, formatDateTime } from "../utils/format";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -28,6 +35,7 @@ interface InstallTrackerViewProps {
   activeSessions: ActiveTrackSession[];
   traces: InstallTrace[];
   defaultExtraRoots: string[];
+  defaultTrackMode: TrackMode;
   prefillInstallerPath?: string | null;
   onConsumePrefill?: () => void;
   onRefresh: () => void;
@@ -40,6 +48,7 @@ export function InstallTrackerView({
   activeSessions,
   traces,
   defaultExtraRoots,
+  defaultTrackMode,
   prefillInstallerPath,
   onConsumePrefill,
   onRefresh,
@@ -49,15 +58,51 @@ export function InstallTrackerView({
   const [appName, setAppName] = useState("");
   const [installerPath, setInstallerPath] = useState("");
   const [extraRoots, setExtraRoots] = useState<string[]>(defaultExtraRoots);
+  const [trackMode, setTrackMode] = useState<TrackMode>(defaultTrackMode);
   const [launchInstaller, setLaunchInstaller] = useState(true);
   const [starting, setStarting] = useState(false);
   const [finishingId, setFinishingId] = useState<string | null>(null);
   const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
   const [pendingDeleteTrace, setPendingDeleteTrace] = useState<InstallTrace | null>(null);
+  const [liveStats, setLiveStats] = useState<Record<string, EtwSessionStats>>({});
 
   useEffect(() => {
     setExtraRoots(defaultExtraRoots);
   }, [defaultExtraRoots]);
+
+  useEffect(() => {
+    setTrackMode(defaultTrackMode);
+  }, [defaultTrackMode]);
+
+  // Periodically poll live ETW PID/file/registry counters for active ETW sessions.
+  const activeEtwIds = activeSessions
+    .filter((s) => s.etwActive)
+    .map((s) => s.sessionId)
+    .join(",");
+
+  useEffect(() => {
+    if (!activeEtwIds) return;
+    const ids = activeEtwIds.split(",").filter(Boolean);
+    let cancelled = false;
+    const pollAll = async () => {
+      for (const sid of ids) {
+        try {
+          const stats = await api.pollInstallTrackStats(sid);
+          if (!cancelled && stats) {
+            setLiveStats((prev) => ({ ...prev, [sid]: stats }));
+          }
+        } catch {
+          // Ignore transient poll errors
+        }
+      }
+    };
+    void pollAll();
+    const timer = window.setInterval(() => void pollAll(), 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeEtwIds]);
 
   useEffect(() => {
     if (prefillInstallerPath) {
@@ -92,8 +137,10 @@ export function InstallTrackerView({
     }
   };
 
+  const etwBlocked = trackMode === "etwRealtime" && (!installerPath.trim() || !launchInstaller);
+
   const handleStart = async () => {
-    if (!appName.trim()) return;
+    if (!appName.trim() || etwBlocked) return;
     setStarting(true);
     try {
       await api.startInstallTrack(
@@ -101,6 +148,7 @@ export function InstallTrackerView({
         installerPath.trim(),
         launchInstaller,
         extraRoots,
+        trackMode,
       );
       onNotify("success", dict.tracker.activeTitle, appName.trim());
       setAppName("");
@@ -232,9 +280,16 @@ export function InstallTrackerView({
 
         {/* Active Sessions Banner */}
         {activeSessions.map((sess) => {
-          const baselineText = dict.tracker.baselineSummary
-            .replace("{dirs}", String(sess.baselineDirCount))
-            .replace("{regs}", String(sess.baselineRegCount));
+          const stats = liveStats[sess.sessionId];
+          const isEtw = sess.trackMode === "etwRealtime" || Boolean(sess.etwActive);
+          const summaryText = isEtw
+            ? dict.tracker.etwStats
+                .replace("{pids}", String(stats?.trackedPidCount ?? sess.trackedPidCount ?? 1))
+                .replace("{files}", String(stats?.capturedFileCount ?? sess.capturedFileCount ?? 0))
+                .replace("{regs}", String(stats?.capturedRegCount ?? sess.capturedRegCount ?? 0))
+            : dict.tracker.baselineSummary
+                .replace("{dirs}", String(sess.baselineDirCount))
+                .replace("{regs}", String(sess.baselineRegCount));
           return (
             <div
               key={sess.sessionId}
@@ -250,9 +305,12 @@ export function InstallTrackerView({
                   <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
                     {dict.tracker.activeTitle}: {sess.appName}
                   </span>
+                  <span className="rounded-full bg-[var(--bg-surface)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--text-secondary)]">
+                    {isEtw ? dict.tracker.badgeEtw : dict.tracker.badgeSnapshot}
+                  </span>
                 </div>
                 <span className="num-tabular text-[11.5px] text-[var(--text-secondary)]">
-                  {baselineText}
+                  {summaryText}
                 </span>
               </div>
 
@@ -296,10 +354,43 @@ export function InstallTrackerView({
 
         {/* Start New Tracking Card */}
         <section className="ui-card space-y-4 p-5">
-          <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--text-primary)]">
-            <Activity className="h-4 w-4 text-[var(--text-tertiary)]" strokeWidth={1.5} />
-            <span>{dict.tracker.newTitle}</span>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--text-primary)]">
+              <Activity className="h-4 w-4 text-[var(--text-tertiary)]" strokeWidth={1.5} />
+              <span>{dict.tracker.newTitle}</span>
+            </div>
+
+            <div className="inline-flex items-center gap-1 rounded-[10px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-1">
+              {(
+                [
+                  { id: "etwRealtime" as TrackMode, label: dict.tracker.modeEtw },
+                  { id: "hybridSnapshot" as TrackMode, label: dict.tracker.modeSnapshot },
+                ] as const
+              ).map((opt) => {
+                const active = trackMode === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setTrackMode(opt.id)}
+                    className={`rounded-[7px] px-2.5 py-1 text-[11.5px] transition-colors duration-150 cursor-pointer ${
+                      active
+                        ? "bg-[var(--bg-surface)] font-medium text-[var(--text-primary)] shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
+                        : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
+
+          <p className="text-[12px] leading-relaxed text-[var(--text-secondary)]">
+            {trackMode === "etwRealtime"
+              ? dict.tracker.modeEtwHint
+              : dict.tracker.modeSnapshotHint}
+          </p>
 
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <input
@@ -370,6 +461,12 @@ export function InstallTrackerView({
             )}
           </div>
 
+          {etwBlocked && (
+            <div className="rounded-[10px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-3 py-2 text-[11.5px] text-[var(--text-secondary)]">
+              {dict.tracker.etwNeedsInstaller}
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center justify-between gap-3 pt-0.5">
             <label className="flex items-center gap-2.5 text-[12.5px] text-[var(--text-secondary)] cursor-pointer">
               <input
@@ -382,7 +479,7 @@ export function InstallTrackerView({
             </label>
             <button
               type="button"
-              disabled={!appName.trim() || starting}
+              disabled={!appName.trim() || etwBlocked || starting}
               onClick={handleStart}
               className="ui-btn-primary h-8.5"
             >
@@ -446,6 +543,11 @@ export function InstallTrackerView({
                           </button>
                           <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
                             {trace.appName}
+                          </span>
+                          <span className="rounded-full bg-[var(--bg-subtle)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+                            {trace.trackMode === "etwRealtime"
+                              ? dict.tracker.badgeEtw
+                              : dict.tracker.badgeSnapshot}
                           </span>
                           <span className="num-tabular text-[11.5px] text-[var(--text-tertiary)]">
                             {formatDateTime(trace.completedAt)}

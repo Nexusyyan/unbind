@@ -8,18 +8,24 @@ import type {
   CleanupOptions,
   CleanupReport,
   CliAction,
+  EtwSessionStats,
   ExportFormat,
   InstallTrace,
   InstalledApp,
   LeftoverItem,
   LockingProcessInfo,
   OperationLogEntry,
+  PortableApp,
   RunningProcessInfo,
   ShellIntegrationStatus,
+  ShortcutLocation,
   StartupItem,
   SystemStatus,
+  TrackMode,
   UninstallExecutionResult,
   UpdateCheckResult,
+  WingetCheckResult,
+  WingetUpgradeResult,
 } from "../types";
 
 export function isTauriRuntime(): boolean {
@@ -35,7 +41,7 @@ export const api = {
         portableMode: true,
         dataDir: "C:\\Portable\\Unbind\\unbind-data",
         windowsVersion: "Windows 11 Preview",
-        appVersion: "0.4.0",
+        appVersion: "0.5.0",
       };
     }
     return invoke<SystemStatus>("get_system_status");
@@ -54,6 +60,8 @@ export const api = {
         language: "auto",
         theme: "system",
         customTrackRoots: [],
+        portableAppRoots: [],
+        defaultTrackMode: "hybridSnapshot",
       };
     }
     return invoke<AppSettings>("get_settings");
@@ -137,13 +145,20 @@ export const api = {
     installerPath: string,
     launchInstaller: boolean,
     extraRoots?: string[],
+    trackMode?: TrackMode,
   ): Promise<ActiveTrackSession> {
     return invoke<ActiveTrackSession>("start_install_track", {
       appName,
       installerPath,
       launchInstaller,
       extraRoots: extraRoots ?? [],
+      trackMode: trackMode ?? "hybridSnapshot",
     });
+  },
+
+  async pollInstallTrackStats(sessionId: string): Promise<EtwSessionStats | null> {
+    if (!isTauriRuntime()) return null;
+    return invoke<EtwSessionStats | null>("poll_install_track_stats", { sessionId });
   },
 
   async finishInstallTrack(sessionId: string): Promise<InstallTrace> {
@@ -264,6 +279,44 @@ export const api = {
   async takePendingCliAction(): Promise<CliAction | null> {
     if (!isTauriRuntime()) return null;
     return invoke<CliAction | null>("take_pending_cli_action");
+  },
+
+  async listPortableApps(roots: string[]): Promise<PortableApp[]> {
+    if (!isTauriRuntime() || roots.length === 0) return [];
+    return invoke<PortableApp[]>("list_portable_apps", { roots });
+  },
+
+  async getPortableAppIcons(appIds: string[]): Promise<Record<string, string>> {
+    if (!isTauriRuntime() || appIds.length === 0) return {};
+    return invoke<Record<string, string>>("get_portable_app_icons", { appIds });
+  },
+
+  async launchPortableApp(exePath: string, workingDir: string): Promise<void> {
+    return invoke<void>("launch_portable_app", { exePath, workingDir });
+  },
+
+  async createPortableShortcut(
+    exePath: string,
+    name: string,
+    location: ShortcutLocation,
+  ): Promise<string> {
+    return invoke<string>("create_portable_shortcut", { exePath, name, location });
+  },
+
+  async checkWingetUpdates(): Promise<WingetCheckResult> {
+    if (!isTauriRuntime()) {
+      return {
+        available: false,
+        wingetVersion: "",
+        updates: [],
+        error: "Unavailable in browser preview",
+      };
+    }
+    return invoke<WingetCheckResult>("check_winget_updates");
+  },
+
+  async runWingetUpgrade(packageId: string, appName: string): Promise<WingetUpgradeResult> {
+    return invoke<WingetUpgradeResult>("run_winget_upgrade", { packageId, appName });
   },
 
   async pickFile(filters?: Array<{ name: string; extensions: string[] }>): Promise<string | null> {

@@ -127,10 +127,25 @@ describe("format utilities", () => {
       query: "",
       showSystemComponents: false,
       showWindowsUpdates: false,
+      updatableAppIds: new Set(["1"]),
     });
     expect(counts.all).toBe(2);
+    expect(counts.updatable).toBe(1);
     expect(counts.large).toBe(1);
     expect(counts.broken).toBe(1);
+
+    const updatable = filterAndSortApps(sampleApps, {
+      storeOnly: false,
+      query: "",
+      filterMode: "updatable",
+      sortField: "name",
+      sortDesc: false,
+      showSystemComponents: false,
+      showWindowsUpdates: false,
+      updatableAppIds: new Set(["1"]),
+    });
+    expect(updatable).toHaveLength(1);
+    expect(updatable[0].id).toBe("1");
   });
 
   it("localizes structured leftover reason codes in both locales", () => {
