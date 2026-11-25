@@ -10,12 +10,25 @@
 </p>
 
 <p align="center">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-18181b?style=flat-square" />
+  <a href="https://github.com/Nexusyyan/unbind/releases/latest">
+    <img alt="Latest Release" src="https://img.shields.io/github/v/release/Nexusyyan/unbind?style=flat-square&color=18181b" />
+  </a>
+  <a href="https://github.com/Nexusyyan/unbind/actions/workflows/ci.yml">
+    <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Nexusyyan/unbind/ci.yml?style=flat-square&label=CI" />
+  </a>
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-27272a?style=flat-square" />
   <img alt="Stack" src="https://img.shields.io/badge/stack-Rust%20%2B%20Tauri%20v2-52525b?style=flat-square" />
   <img alt="License" src="https://img.shields.io/badge/license-MIT-71717a?style=flat-square" />
 </p>
 
 ---
+
+## Download
+
+Grab the latest prebuilt Windows binary from **[GitHub Releases](https://github.com/Nexusyyan/unbind/releases/latest)** (built automatically from source via GitHub Actions with `SHA256SUMS.txt`):
+
+- **Portable ZIP** (`unbind-v*-x86_64-windows-portable.zip`): Includes `unbind.exe` and `portable.json`. Extract anywhere to keep all settings, registry backups, traces, and logs inside `./unbind-data`.
+- **Standalone EXE** (`unbind-v*-x86_64-windows.exe`): Single-file executable storing data under `%LOCALAPPDATA%\Unbind` (Portable Mode can be toggled anytime in Settings).
 
 ## Features
 

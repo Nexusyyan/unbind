@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.3.0; defaults to v<version> from Cargo.toml)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Portable Windows Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            $tag = $env:GITHUB_REF_NAME
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_TAG)) {
+            $tag = $env:INPUT_TAG.Trim()
+          } else {
+            $cargoToml = Get-Content -Raw -Path 'Cargo.toml'
+            if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
+              $tag = "v$($Matches[1])"
+            } else {
+              throw 'Failed to read version from Cargo.toml'
+            }
+          }
+
+          if ($tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') {
+            throw "Invalid release tag '$tag'. Expected format like v0.3.0"
+          }
+
+          Write-Host "Resolved release tag: $tag"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run quality gates
+        run: |
+          pnpm typecheck
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build single-file release executable
+        run: |
+          pnpm tauri build --no-bundle
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'target/release/unbind.exe')) {
+            throw 'Expected target/release/unbind.exe was not produced'
+          }
+
+      - name: Package portable ZIP, standalone EXE, and SHA256SUMS
+        id: package
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $outDir = 'release-artifacts'
+          $stageDir = 'release-stage'
+
+          Remove-Item -Recurse -Force $outDir, $stageDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $outDir, $stageDir | Out-Null
+
+          $standaloneName = "unbind-$tag-x86_64-windows.exe"
+          $portableZipName = "unbind-$tag-x86_64-windows-portable.zip"
+
+          Copy-Item 'target/release/unbind.exe' (Join-Path $outDir $standaloneName)
+
+          # Stage portable bundle (flat archive root so Windows Extract All creates one clean folder)
+          Copy-Item 'target/release/unbind.exe' (Join-Path $stageDir 'unbind.exe')
+          Copy-Item 'LICENSE' (Join-Path $stageDir 'LICENSE')
+          Copy-Item 'README.md' (Join-Path $stageDir 'README.md')
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Resolve-Path $stageDir).Path 'portable.json'),
+            "{`"portable`":true}`n",
+            $utf8NoBom
+          )
+
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath (Join-Path $outDir $portableZipName) -CompressionLevel Optimal
+
+          $zipHash = (Get-FileHash -Algorithm SHA256 (Join-Path $outDir $portableZipName)).Hash.ToLowerInvariant()
+          $exeHash = (Get-FileHash -Algorithm SHA256 (Join-Path $outDir $standaloneName)).Hash.ToLowerInvariant()
+
+          $sumsContent = "$zipHash  $portableZipName`n$exeHash  $standaloneName`n"
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Resolve-Path $outDir).Path 'SHA256SUMS.txt'),
+            $sumsContent,
+            $utf8NoBom
+          )
+
+          Get-ChildItem $outDir | ForEach-Object {
+            Write-Host ("Artifact: {0} ({1:N2} MB)" -f $_.Name, ($_.Length / 1MB))
+          }
+          Write-Host "SHA256SUMS.txt:"
+          Write-Host $sumsContent
+
+          "portable_zip=$portableZipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "standalone_exe=$standaloneName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip_sha256=$zipHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "exe_sha256=$exeHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          PORTABLE_ZIP: ${{ steps.package.outputs.portable_zip }}
+          STANDALONE_EXE: ${{ steps.package.outputs.standalone_exe }}
+          ZIP_SHA256: ${{ steps.package.outputs.zip_sha256 }}
+          EXE_SHA256: ${{ steps.package.outputs.exe_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $zipPath = Join-Path 'release-artifacts' $env:PORTABLE_ZIP
+          $exePath = Join-Path 'release-artifacts' $env:STANDALONE_EXE
+          $sumsPath = Join-Path 'release-artifacts' 'SHA256SUMS.txt'
+
+          $notesTemplate = @'
+          ### Downloads
+
+          | Package | Description | SHA-256 |
+          | --- | --- | --- |
+          | `__PORTABLE_ZIP__` | **Portable bundle** (`unbind.exe` + `portable.json` + `LICENSE`). Extract and run; all settings, backups, traces, and logs stay inside `./unbind-data`. | `__ZIP_SHA256__` |
+          | `__STANDALONE_EXE__` | **Standalone executable**. Run directly; stores app data in `%LOCALAPPDATA%\Unbind` (or toggle Portable Mode anytime in Settings). | `__EXE_SHA256__` |
+
+          > Built transparently from source via GitHub Actions (`windows-latest`). Verify downloads against `SHA256SUMS.txt`.
+          '@
+          $notes = $notesTemplate.
+            Replace('__PORTABLE_ZIP__', $env:PORTABLE_ZIP).
+            Replace('__ZIP_SHA256__', $env:ZIP_SHA256).
+            Replace('__STANDALONE_EXE__', $env:STANDALONE_EXE).
+            Replace('__EXE_SHA256__', $env:EXE_SHA256)
+
+          $prevEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag 2>&1 | Out-Null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = $prevEap
+
+          if ($releaseExists) {
+            Write-Host "Release $tag already exists; uploading updated assets..."
+            gh release upload $tag $zipPath $exePath $sumsPath --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --title "Unbind $tag" --notes $notes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "Creating GitHub Release $tag..."
+            $cmdArgs = @(
+              'release', 'create', $tag,
+              $zipPath, $exePath, $sumsPath,
+              '--title', "Unbind $tag",
+              '--notes', $notes,
+              '--generate-notes',
+              '--target', $env:GITHUB_SHA
+            )
+            if ($tag -match '-') {
+              $cmdArgs += '--prerelease'
+            }
+            & gh @cmdArgs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
