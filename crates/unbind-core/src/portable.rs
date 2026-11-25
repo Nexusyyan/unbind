@@ -74,6 +74,18 @@ impl AppStorage {
         self.data_dir.join(SETTINGS_FILE)
     }
 
+    pub fn size_cache_file(&self) -> PathBuf {
+        self.data_dir.join("size-cache.json")
+    }
+
+    pub fn clear_logs(&self) -> CoreResult<()> {
+        let path = self.logs_file();
+        if path.exists() {
+            fs::write(&path, "")?;
+        }
+        Ok(())
+    }
+
     pub fn load_settings(&self) -> AppSettings {
         let mut settings = fs::read_to_string(self.settings_file())
             .ok()

@@ -431,7 +431,12 @@ pub fn export_registry_backup(
 ) -> CoreResult<Option<PathBuf>> {
     let reg_items: Vec<&LeftoverItem> = items
         .iter()
-        .filter(|i| matches!(i.kind, LeftoverKind::RegistryKey | LeftoverKind::RegistryValue))
+        .filter(|i| {
+            matches!(
+                i.kind,
+                LeftoverKind::RegistryKey | LeftoverKind::RegistryValue | LeftoverKind::Service
+            )
+        })
         .collect();
 
     if reg_items.is_empty() {
@@ -456,7 +461,7 @@ pub fn export_registry_backup(
         };
 
         match item.kind {
-            LeftoverKind::RegistryKey => {
+            LeftoverKind::RegistryKey | LeftoverKind::Service => {
                 export_key_recursive(
                     &key,
                     hive_to_long_name(&hive),
@@ -911,6 +916,134 @@ pub fn list_backups(backup_dir: &Path) -> Vec<BackupEntry> {
     results
 }
 
+fn ensure_backup_path_contained(path: &Path, backup_dir: &Path) -> CoreResult<PathBuf> {
+    if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("reg")) != Some(true)
+    {
+        return Err(CoreError::InvalidInput(
+            "Only .reg backup files are permitted".to_string(),
+        ));
+    }
+    let canon_dir = fs::canonicalize(backup_dir)
+        .map_err(|_| CoreError::NotFound("Backups directory does not exist".to_string()))?;
+    let canon_file = fs::canonicalize(path)
+        .map_err(|_| CoreError::NotFound(format!("Backup file not found: {}", path.display())))?;
+    let dir_norm = normalize_fs_path(&canon_dir);
+    let file_norm = normalize_fs_path(&canon_file);
+    if !file_norm.starts_with(&format!("{}\\", dir_norm)) {
+        return Err(CoreError::SafetyBlocked(
+            "Backup file path escapes backups directory".to_string(),
+        ));
+    }
+    Ok(canon_file)
+}
+
+fn decode_reg_file_text(bytes: &[u8]) -> String {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
+        let u16s: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        String::from_utf16_lossy(&u16s)
+    } else if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+        String::from_utf8_lossy(&bytes[3..]).to_string()
+    } else {
+        String::from_utf8_lossy(bytes).to_string()
+    }
+}
+
+/// Read and decode a `.reg` backup file safely for in-app preview.
+pub fn preview_registry_backup(
+    path: &Path,
+    backup_dir: &Path,
+    max_chars: usize,
+) -> CoreResult<String> {
+    let valid_path = ensure_backup_path_contained(path, backup_dir)?;
+    let bytes = fs::read(&valid_path)?;
+    let text = decode_reg_file_text(&bytes);
+    if text.chars().count() > max_chars {
+        let truncated: String = text.chars().take(max_chars).collect();
+        Ok(format!(
+            "{}\r\n\r\n; --- Preview truncated (open file to inspect full content) ---",
+            truncated
+        ))
+    } else {
+        Ok(text)
+    }
+}
+
+/// Check whether importing a `.reg` backup requires Administrator privileges (touches HKLM/HKCR/HKU).
+pub fn reg_backup_requires_elevation(path: &Path, backup_dir: &Path) -> CoreResult<bool> {
+    let valid_path = ensure_backup_path_contained(path, backup_dir)?;
+    let bytes = fs::read(&valid_path)?;
+    let upper = decode_reg_file_text(&bytes).to_uppercase();
+    Ok(upper.contains("[HKEY_LOCAL_MACHINE\\")
+        || upper.contains("[-HKEY_LOCAL_MACHINE\\")
+        || upper.contains("[HKEY_CLASSES_ROOT\\")
+        || upper.contains("[-HKEY_CLASSES_ROOT\\")
+        || upper.contains("[HKEY_USERS\\"))
+}
+
+/// Import a `.reg` backup file back into Windows Registry using `reg.exe import`.
+#[cfg(windows)]
+pub fn restore_registry_backup(path: &Path) -> CoreResult<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    if !path.exists() {
+        return Err(CoreError::NotFound(format!(
+            "Backup file not found: {}",
+            path.display()
+        )));
+    }
+    if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("reg")) != Some(true)
+    {
+        return Err(CoreError::InvalidInput(
+            "Only .reg files can be restored".to_string(),
+        ));
+    }
+
+    let out = std::process::Command::new("reg.exe")
+        .arg("import")
+        .arg(path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let combined = if stderr.is_empty() { stdout } else { stderr };
+        if combined.to_lowercase().contains("access is denied")
+            || combined.to_lowercase().contains("error accessing")
+        {
+            Err(CoreError::ElevationRequired(format!(
+                "Administrator privileges required to restore {}",
+                path.display()
+            )))
+        } else {
+            Err(CoreError::WinApi(format!(
+                "reg import failed: {}",
+                combined
+            )))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn restore_registry_backup(_path: &Path) -> CoreResult<()> {
+    Ok(())
+}
+
+/// Safely delete a `.reg` backup file located inside `backup_dir`.
+pub fn delete_backup_file(path: &Path, backup_dir: &Path) -> CoreResult<()> {
+    let valid_path = ensure_backup_path_contained(path, backup_dir)?;
+    fs::remove_file(valid_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1105,8 @@ mod tests {
             size_bytes: 0,
             confidence: crate::models::ConfidenceLevel::High,
             reason: "Unit test".into(),
+            reason_code: "unit_test".into(),
+            reason_param: None,
             selected_by_default: true,
             requires_elevation: false,
         };
@@ -984,9 +1119,25 @@ mod tests {
         // Verify UTF-16LE BOM
         assert_eq!(&raw[0..2], &[0xFF, 0xFE]);
 
+        // Verify preview and elevation detection
+        let preview = preview_registry_backup(&backup, dir.path(), 4000).unwrap();
+        assert!(preview.contains("Sandbox Test App"));
+        assert!(!reg_backup_requires_elevation(&backup, dir.path()).unwrap());
+
         // Verify safe deletion removes our sandbox key
         delete_registry_item(&full_path, None).unwrap();
         assert!(hkcu.open_subkey(&test_subkey).is_err());
+
+        // Verify in-app .reg restore brings the sandbox key right back!
+        restore_registry_backup(&backup).unwrap();
+        let restored = hkcu.open_subkey(&test_subkey).unwrap();
+        let restored_name: String = restored.get_value("DisplayName").unwrap();
+        assert_eq!(restored_name, "Sandbox Test App");
+
+        // Clean up sandbox key and backup file
+        delete_registry_item(&full_path, None).unwrap();
+        delete_backup_file(&backup, dir.path()).unwrap();
+        assert!(!backup.exists());
     }
 
     #[test]

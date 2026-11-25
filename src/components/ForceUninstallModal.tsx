@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FileSearch, FolderOpen, Hammer, Loader2, Lock, Skull, X } from "lucide-react";
 import { api } from "../api/client";
 import type { Dict } from "../i18n";
@@ -22,6 +22,17 @@ export function ForceUninstallModal({
   const [checkingLocks, setCheckingLocks] = useState(false);
   const [locks, setLocks] = useState<LockingProcessInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !scanning && !checkingLocks) {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [scanning, checkingLocks, onClose]);
 
   const handlePickFile = async () => {
     const picked = await api.pickFile([

@@ -1,5 +1,6 @@
 pub mod appx;
 pub mod icon;
+pub mod size;
 pub mod win32;
 
 use crate::models::{CoreError, CoreResult, InstalledApp};
@@ -10,6 +11,14 @@ use std::process::Command;
 
 /// Discover both Win32/MSI and UWP/MSIX applications in parallel, enriched with Install Tracker metadata.
 pub fn discover_all_apps(traces_dir: &Path) -> Vec<InstalledApp> {
+    discover_all_apps_with_cache(traces_dir, None)
+}
+
+/// Discover all applications and immediately apply warm disk size cache when provided.
+pub fn discover_all_apps_with_cache(
+    traces_dir: &Path,
+    size_cache_path: Option<&Path>,
+) -> Vec<InstalledApp> {
     let (mut win32_apps, appx_apps) = rayon::join(win32::discover_win32_apps, appx::discover_appx_apps);
     win32_apps.extend(appx_apps);
 
@@ -31,6 +40,10 @@ pub fn discover_all_apps(traces_dir: &Path) -> Vec<InstalledApp> {
                 app.tracked_trace_id = Some(tid.clone());
             }
         }
+    }
+
+    if let Some(cache_path) = size_cache_path {
+        size::apply_cached_sizes(&mut win32_apps, cache_path);
     }
 
     win32_apps.sort_by_key(|a| a.name.to_lowercase());

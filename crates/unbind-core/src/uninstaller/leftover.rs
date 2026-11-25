@@ -1,11 +1,13 @@
+use crate::discovery::size::uwp_package_data_dir;
 use crate::models::{
     AppKind, Arch, ConfidenceLevel, InstallScope, InstallTrace, InstalledApp, LeftoverItem,
-    LeftoverKind,
+    LeftoverKind, PackageManagerKind,
 };
 use crate::safety::{
     is_generic_token, is_protected_path, is_protected_registry_key, normalize_fs_path,
     open_predef_hive, split_registry_path,
 };
+use crate::startup::enumerate_third_party_scheduled_tasks;
 use crate::unlocker::resolve_shortcut_target;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -21,11 +23,21 @@ pub struct SearchAnchors {
     pub clean_name: String,
     pub compact_name: String,
     pub publisher: String,
+    pub kind: AppKind,
     pub install_dir: Option<PathBuf>,
     pub install_dir_norm: Option<String>,
     pub install_dir_leaf: Option<String>,
     pub product_code: Option<String>,
     pub registry_key: Option<String>,
+    pub package_family_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchHit {
+    pub confidence: ConfidenceLevel,
+    pub reason: String,
+    pub reason_code: &'static str,
+    pub reason_param: Option<String>,
 }
 
 impl SearchAnchors {
@@ -68,21 +80,29 @@ impl SearchAnchors {
             Some(app.registry_key.trim().to_string())
         };
 
+        let package_family_name = if app.package_family_name.trim().is_empty() {
+            None
+        } else {
+            Some(app.package_family_name.trim().to_string())
+        };
+
         Self {
             app_name: app.name.clone(),
             clean_name,
             compact_name,
             publisher: app.publisher.trim().to_string(),
+            kind: app.kind,
             install_dir,
             install_dir_norm,
             install_dir_leaf,
             product_code,
             registry_key,
+            package_family_name,
         }
     }
 
     /// Match strength against a candidate folder or registry key name.
-    pub fn match_name(&self, candidate: &str) -> Option<(ConfidenceLevel, String)> {
+    pub fn match_name(&self, candidate: &str) -> Option<MatchHit> {
         let cand_trim = candidate.trim();
         if cand_trim.len() < 3 || is_generic_token(cand_trim) {
             return None;
@@ -96,41 +116,56 @@ impl SearchAnchors {
         // 1. Exact ProductCode GUID match
         if let Some(guid) = &self.product_code {
             if cand_trim.eq_ignore_ascii_case(guid) {
-                return Some((ConfidenceLevel::High, "Matches MSI ProductCode".to_string()));
+                return Some(MatchHit {
+                    confidence: ConfidenceLevel::High,
+                    reason: "Matches MSI ProductCode".to_string(),
+                    reason_code: "match_msi_guid",
+                    reason_param: Some(guid.clone()),
+                });
             }
         }
 
         // 2. Exact match with install folder leaf name
         if let Some(leaf) = &self.install_dir_leaf {
             if cand_lower == leaf.to_lowercase() {
-                return Some((
-                    ConfidenceLevel::High,
-                    format!("Exact match with install folder '{}'", leaf),
-                ));
+                return Some(MatchHit {
+                    confidence: ConfidenceLevel::High,
+                    reason: format!("Exact match with install folder '{}'", leaf),
+                    reason_code: "exact_install_folder",
+                    reason_param: Some(leaf.clone()),
+                });
             }
         }
 
         // 3. Exact match with cleaned app name (normal or compact)
         let clean_lower = self.clean_name.to_lowercase();
         if !is_generic_token(&clean_lower) {
-            if cand_lower == clean_lower || (self.compact_name.len() >= 4 && cand_compact == self.compact_name) {
-                return Some((
-                    ConfidenceLevel::High,
-                    format!("Exact match with application name '{}'", self.clean_name),
-                ));
+            if cand_lower == clean_lower
+                || (self.compact_name.len() >= 4 && cand_compact == self.compact_name)
+            {
+                return Some(MatchHit {
+                    confidence: ConfidenceLevel::High,
+                    reason: format!("Exact match with application name '{}'", self.clean_name),
+                    reason_code: "exact_app_name",
+                    reason_param: Some(self.clean_name.clone()),
+                });
             }
             // Substring match requires longer anchor (>= 6 chars) to prevent false positives.
             if clean_lower.len() >= 6 && cand_lower.contains(&clean_lower) {
-                return Some((
-                    ConfidenceLevel::Medium,
-                    format!("Name contains '{}'", self.clean_name),
-                ));
+                return Some(MatchHit {
+                    confidence: ConfidenceLevel::Medium,
+                    reason: format!("Name contains '{}'", self.clean_name),
+                    reason_code: "contains_app_name",
+                    reason_param: Some(self.clean_name.clone()),
+                });
             }
             if self.compact_name.len() >= 6 && cand_compact.contains(&self.compact_name) {
-                return Some((
-                    ConfidenceLevel::Medium,
-                    format!("Normalized name contains '{}'", self.compact_name),
-                ));
+                return Some(MatchHit {
+                    confidence: ConfidenceLevel::Medium,
+                    reason: format!("Normalized name contains '{}'", self.compact_name),
+                    reason_code: "contains_app_name",
+                    reason_param: Some(self.compact_name.clone()),
+                });
             }
         }
 
@@ -154,7 +189,6 @@ impl SearchAnchors {
 /// "7-Zip 24.08 (x64 edition)" -> "7-Zip"
 pub fn strip_version_and_noise(name: &str) -> String {
     let mut s = name.to_string();
-    // Remove parenthesized noise like (x64), (64-bit), (x86), (en-US)
     while let (Some(start), Some(end)) = (s.find('('), s.find(')')) {
         if end > start {
             s.replace_range(start..=end, " ");
@@ -173,7 +207,6 @@ pub fn strip_version_and_noise(name: &str) -> String {
             ) {
                 return false;
             }
-            // Drop standalone version tokens like "v2.4.1", "24.08", "2024.1"
             let stripped = lower.trim_start_matches('v');
             let is_ver = !stripped.is_empty()
                 && stripped.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-')
@@ -204,20 +237,54 @@ fn strip_company_suffix(pub_name: &str) -> String {
     tokens.join(" ")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn make_item(
+    kind: LeftoverKind,
+    path: String,
+    value_name: Option<String>,
+    size_bytes: u64,
+    confidence: ConfidenceLevel,
+    reason: String,
+    reason_code: &str,
+    reason_param: Option<String>,
+    selected_by_default: bool,
+    requires_elevation: bool,
+) -> LeftoverItem {
+    LeftoverItem {
+        id: Uuid::new_v4().to_string(),
+        kind,
+        path,
+        value_name,
+        size_bytes,
+        confidence,
+        reason,
+        reason_code: reason_code.to_string(),
+        reason_param,
+        selected_by_default,
+        requires_elevation,
+    }
+}
+
 /// Run a multi-threaded deep leftover scan for an installed (or recently uninstalled) app.
 pub fn scan_leftovers(app: &InstalledApp, trace: Option<&InstallTrace>) -> Vec<LeftoverItem> {
     let anchors = SearchAnchors::from_app(app);
 
-    let (fs_items, reg_items) = rayon::join(
-        || scan_filesystem_leftovers(&anchors),
-        || scan_registry_leftovers(&anchors),
+    let ((fs_items, reg_items), task_items) = rayon::join(
+        || {
+            rayon::join(
+                || scan_filesystem_leftovers(&anchors),
+                || scan_registry_leftovers(&anchors),
+            )
+        },
+        || scan_scheduled_task_leftovers(&anchors),
     );
 
-    let mut combined = Vec::with_capacity(fs_items.len() + reg_items.len() + 16);
+    let mut combined = Vec::with_capacity(fs_items.len() + reg_items.len() + task_items.len() + 16);
     combined.extend(reg_items);
     combined.extend(fs_items);
+    combined.extend(task_items);
 
-    // Merge recorded Install Tracker trace items (if any still exist on disk/registry).
+    // Merge recorded Install Tracker trace items (if any still exist on disk/registry/SCM/tasks).
     if let Some(tr) = trace {
         append_trace_leftovers(tr, &mut combined);
     }
@@ -237,7 +304,7 @@ pub fn scan_leftovers(app: &InstalledApp, trace: Option<&InstallTrace>) -> Vec<L
         }
     }
 
-    // Sort High confidence first, then Registry -> Directories -> Files -> Shortcuts -> Services.
+    // Sort High confidence first, then path alphabetically.
     deduped.sort_by(|a, b| {
         let conf_ord = |c: ConfidenceLevel| match c {
             ConfidenceLevel::High => 0,
@@ -253,7 +320,7 @@ pub fn scan_leftovers(app: &InstalledApp, trace: Option<&InstallTrace>) -> Vec<L
 }
 
 /// Build a synthetic InstalledApp target from any dropped file, `.lnk` shortcut, or folder path
-/// for Force Removal (similar to Uninstall Tool's Force Removal / Drag-and-Drop).
+/// for Force Removal.
 pub fn build_force_target_from_path(raw_path: &Path) -> InstalledApp {
     let resolved = if raw_path
         .extension()
@@ -319,6 +386,8 @@ pub fn build_force_target_from_path(raw_path: &Path) -> InstalledApp {
         is_valid_entry: true,
         has_uninstaller: false,
         tracked_trace_id: None,
+        package_manager: PackageManagerKind::None,
+        size_measured: false,
     }
 }
 
@@ -330,21 +399,45 @@ fn scan_filesystem_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
         if dir.exists() && !is_protected_path(dir) {
             let size = compute_dir_size_bounded(dir, 5000);
             let req_elev = path_likely_needs_elevation(dir);
-            items.push(LeftoverItem {
-                id: Uuid::new_v4().to_string(),
-                kind: if dir.is_dir() {
+            items.push(make_item(
+                if dir.is_dir() {
                     LeftoverKind::Directory
                 } else {
                     LeftoverKind::File
                 },
-                path: dir.to_string_lossy().to_string(),
-                value_name: None,
-                size_bytes: size,
-                confidence: ConfidenceLevel::High,
-                reason: "Remaining installation directory".to_string(),
-                selected_by_default: true,
-                requires_elevation: req_elev,
-            });
+                dir.to_string_lossy().to_string(),
+                None,
+                size,
+                ConfidenceLevel::High,
+                "Remaining installation directory".to_string(),
+                "remaining_install_dir",
+                None,
+                true,
+                req_elev,
+            ));
+        }
+    }
+
+    // 1b. UWP / Store App user data directory under %LOCALAPPDATA%\Packages\<PackageFamilyName>.
+    if anchors.kind == AppKind::StoreApp {
+        if let Some(pfn) = &anchors.package_family_name {
+            if let Some(pkg_data) = uwp_package_data_dir(pfn) {
+                if !is_protected_path(&pkg_data) {
+                    let size = compute_dir_size_bounded(&pkg_data, 5000);
+                    items.push(make_item(
+                        LeftoverKind::Directory,
+                        pkg_data.to_string_lossy().to_string(),
+                        None,
+                        size,
+                        ConfidenceLevel::High,
+                        format!("Microsoft Store app data folder ({})", pfn),
+                        "uwp_package_data",
+                        Some(pfn.clone()),
+                        true,
+                        false,
+                    ));
+                }
+            }
         }
     }
 
@@ -416,30 +509,30 @@ fn scan_fs_container(container: &Path, anchors: &SearchAnchors) -> Vec<LeftoverI
             continue;
         };
 
-        // Skip if already equal to install_dir (handled above).
         if let Some(inst_norm) = &anchors.install_dir_norm {
             if normalize_fs_path(&path) == *inst_norm {
                 continue;
             }
         }
 
-        if let Some((conf, reason)) = anchors.match_name(name) {
+        if let Some(hit) = anchors.match_name(name) {
             let size = compute_dir_size_bounded(&path, 3000);
-            found.push(LeftoverItem {
-                id: Uuid::new_v4().to_string(),
-                kind: LeftoverKind::Directory,
-                path: path.to_string_lossy().to_string(),
-                value_name: None,
-                size_bytes: size,
-                confidence: conf,
-                reason,
-                selected_by_default: conf == ConfidenceLevel::High,
-                requires_elevation: path_likely_needs_elevation(&path),
-            });
+            found.push(make_item(
+                LeftoverKind::Directory,
+                path.to_string_lossy().to_string(),
+                None,
+                size,
+                hit.confidence,
+                hit.reason,
+                hit.reason_code,
+                hit.reason_param,
+                hit.confidence == ConfidenceLevel::High,
+                path_likely_needs_elevation(&path),
+            ));
             continue;
         }
 
-        // Check 2nd-level child inside a matching vendor/publisher directory (e.g. AppData\Roaming\Vendor\App).
+        // Check 2nd-level child inside a matching vendor/publisher directory.
         if anchors.publisher_matches_folder(name) {
             if let Ok(sub_entries) = fs::read_dir(&path) {
                 for sub in sub_entries.flatten() {
@@ -450,27 +543,28 @@ fn scan_fs_container(container: &Path, anchors: &SearchAnchors) -> Vec<LeftoverI
                     let Some(sub_name) = sub_path.file_name().and_then(|n| n.to_str()) else {
                         continue;
                     };
-                    if let Some((conf, reason)) = anchors.match_name(sub_name) {
+                    if let Some(hit) = anchors.match_name(sub_name) {
                         let size = if sub_path.is_dir() {
                             compute_dir_size_bounded(&sub_path, 3000)
                         } else {
                             sub.metadata().map(|m| m.len()).unwrap_or(0)
                         };
-                        found.push(LeftoverItem {
-                            id: Uuid::new_v4().to_string(),
-                            kind: if sub_path.is_dir() {
+                        found.push(make_item(
+                            if sub_path.is_dir() {
                                 LeftoverKind::Directory
                             } else {
                                 LeftoverKind::File
                             },
-                            path: sub_path.to_string_lossy().to_string(),
-                            value_name: None,
-                            size_bytes: size,
-                            confidence: conf,
-                            reason: format!("{} (under publisher folder)", reason),
-                            selected_by_default: conf == ConfidenceLevel::High,
-                            requires_elevation: path_likely_needs_elevation(&sub_path),
-                        });
+                            sub_path.to_string_lossy().to_string(),
+                            None,
+                            size,
+                            hit.confidence,
+                            format!("{} (under publisher folder)", hit.reason),
+                            "publisher_subdir_match",
+                            hit.reason_param,
+                            hit.confidence == ConfidenceLevel::High,
+                            path_likely_needs_elevation(&sub_path),
+                        ));
                     }
                 }
             }
@@ -490,21 +584,21 @@ fn scan_shortcuts_dir(dir: &Path, anchors: &SearchAnchors, out: &mut Vec<Leftove
             continue;
         }
 
-        // Check Start Menu folder matching app name
         if p.is_dir() {
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if let Some((conf, reason)) = anchors.match_name(name) {
-                    out.push(LeftoverItem {
-                        id: Uuid::new_v4().to_string(),
-                        kind: LeftoverKind::Shortcut,
-                        path: p.to_string_lossy().to_string(),
-                        value_name: None,
-                        size_bytes: compute_dir_size_bounded(p, 200),
-                        confidence: conf,
-                        reason: format!("Start Menu folder: {}", reason),
-                        selected_by_default: conf == ConfidenceLevel::High,
-                        requires_elevation: path_likely_needs_elevation(p),
-                    });
+                if let Some(hit) = anchors.match_name(name) {
+                    out.push(make_item(
+                        LeftoverKind::Shortcut,
+                        p.to_string_lossy().to_string(),
+                        None,
+                        compute_dir_size_bounded(p, 200),
+                        hit.confidence,
+                        format!("Start Menu folder: {}", hit.reason),
+                        "start_menu_folder",
+                        hit.reason_param,
+                        hit.confidence == ConfidenceLevel::High,
+                        path_likely_needs_elevation(p),
+                    ));
                 }
             }
             continue;
@@ -519,38 +613,40 @@ fn scan_shortcuts_dir(dir: &Path, anchors: &SearchAnchors, out: &mut Vec<Leftove
             continue;
         }
 
-        let mut matched: Option<(ConfidenceLevel, String)> = None;
+        let mut matched: Option<MatchHit> = None;
         if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
             matched = anchors.match_name(stem);
         }
-        // Also check whether the shortcut points inside the app's install directory.
         if matched.is_none() {
             if let (Some(inst_norm), Some(target)) =
                 (&anchors.install_dir_norm, resolve_shortcut_target(p))
             {
                 let t_norm = normalize_fs_path(&target);
                 if t_norm.starts_with(inst_norm) {
-                    matched = Some((
-                        ConfidenceLevel::High,
-                        "Shortcut targets uninstalled application directory".to_string(),
-                    ));
+                    matched = Some(MatchHit {
+                        confidence: ConfidenceLevel::High,
+                        reason: "Shortcut targets uninstalled application directory".to_string(),
+                        reason_code: "shortcut_target_match",
+                        reason_param: None,
+                    });
                 }
             }
         }
 
-        if let Some((conf, reason)) = matched {
+        if let Some(hit) = matched {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push(LeftoverItem {
-                id: Uuid::new_v4().to_string(),
-                kind: LeftoverKind::Shortcut,
-                path: p.to_string_lossy().to_string(),
-                value_name: None,
-                size_bytes: size,
-                confidence: conf,
-                reason,
-                selected_by_default: conf == ConfidenceLevel::High,
-                requires_elevation: path_likely_needs_elevation(p),
-            });
+            out.push(make_item(
+                LeftoverKind::Shortcut,
+                p.to_string_lossy().to_string(),
+                None,
+                size,
+                hit.confidence,
+                hit.reason,
+                hit.reason_code,
+                hit.reason_param,
+                hit.confidence == ConfidenceLevel::High,
+                path_likely_needs_elevation(p),
+            ));
         }
     }
 }
@@ -564,17 +660,18 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
             if !is_protected_registry_key(&hive, &subkey) {
                 if let Ok(root) = open_predef_hive(&hive) {
                     if root.open_subkey_with_flags(&subkey, KEY_READ).is_ok() {
-                        items.push(LeftoverItem {
-                            id: Uuid::new_v4().to_string(),
-                            kind: LeftoverKind::RegistryKey,
-                            path: reg_path.clone(),
-                            value_name: None,
-                            size_bytes: 0,
-                            confidence: ConfidenceLevel::High,
-                            reason: "Remaining Uninstall registry entry".to_string(),
-                            selected_by_default: true,
-                            requires_elevation: hive.eq_ignore_ascii_case("HKLM"),
-                        });
+                        items.push(make_item(
+                            LeftoverKind::RegistryKey,
+                            reg_path.clone(),
+                            None,
+                            0,
+                            ConfidenceLevel::High,
+                            "Remaining Uninstall registry entry".to_string(),
+                            "remaining_uninstall_reg",
+                            None,
+                            true,
+                            hive.eq_ignore_ascii_case("HKLM"),
+                        ));
                     }
                 }
             }
@@ -605,22 +702,22 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
             if is_protected_registry_key(hive_name, &full_sub) {
                 continue;
             }
-            if let Some((conf, reason)) = anchors.match_name(&sub_name) {
-                items.push(LeftoverItem {
-                    id: Uuid::new_v4().to_string(),
-                    kind: LeftoverKind::RegistryKey,
-                    path: format!("{}\\{}", hive_name, full_sub),
-                    value_name: None,
-                    size_bytes: 0,
-                    confidence: conf,
-                    reason,
-                    selected_by_default: conf == ConfidenceLevel::High,
-                    requires_elevation: needs_elev,
-                });
+            if let Some(hit) = anchors.match_name(&sub_name) {
+                items.push(make_item(
+                    LeftoverKind::RegistryKey,
+                    format!("{}\\{}", hive_name, full_sub),
+                    None,
+                    0,
+                    hit.confidence,
+                    hit.reason,
+                    hit.reason_code,
+                    hit.reason_param,
+                    hit.confidence == ConfidenceLevel::High,
+                    needs_elev,
+                ));
                 continue;
             }
 
-            // 2nd level under matching publisher key (e.g. HKCU\Software\Vendor\App).
             if anchors.publisher_matches_folder(&sub_name) {
                 if let Ok(vendor_key) = base.open_subkey_with_flags(&sub_name, flags) {
                     for child in vendor_key.enum_keys().flatten() {
@@ -628,18 +725,19 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
                         if is_protected_registry_key(hive_name, &child_sub) {
                             continue;
                         }
-                        if let Some((conf, reason)) = anchors.match_name(&child) {
-                            items.push(LeftoverItem {
-                                id: Uuid::new_v4().to_string(),
-                                kind: LeftoverKind::RegistryKey,
-                                path: format!("{}\\{}", hive_name, child_sub),
-                                value_name: None,
-                                size_bytes: 0,
-                                confidence: conf,
-                                reason: format!("{} (under publisher key)", reason),
-                                selected_by_default: conf == ConfidenceLevel::High,
-                                requires_elevation: needs_elev,
-                            });
+                        if let Some(hit) = anchors.match_name(&child) {
+                            items.push(make_item(
+                                LeftoverKind::RegistryKey,
+                                format!("{}\\{}", hive_name, child_sub),
+                                None,
+                                0,
+                                hit.confidence,
+                                format!("{} (under publisher key)", hit.reason),
+                                "publisher_subkey_match",
+                                hit.reason_param,
+                                hit.confidence == ConfidenceLevel::High,
+                                needs_elev,
+                            ));
                         }
                     }
                 }
@@ -647,7 +745,7 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
         }
     }
 
-    // 3. Startup Run values, App Paths, MuiCache, and Services referencing install_dir.
+    // 3. Startup Run values (64/32-bit), App Paths, MuiCache, Services, and Shell Context Menus.
     if let Some(inst_norm) = &anchors.install_dir_norm {
         if inst_norm.len() >= 8 {
             scan_reg_values_referencing_path(
@@ -657,6 +755,7 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
                 inst_norm,
                 false,
                 "Startup entry references uninstalled directory",
+                "startup_run_ref",
                 &mut items,
             );
             scan_reg_values_referencing_path(
@@ -666,6 +765,17 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
                 inst_norm,
                 true,
                 "Machine startup entry references uninstalled directory",
+                "startup_run_ref",
+                &mut items,
+            );
+            scan_reg_values_referencing_path(
+                "HKLM",
+                HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+                inst_norm,
+                true,
+                "32-bit machine startup entry references uninstalled directory",
+                "startup_run_ref",
                 &mut items,
             );
             scan_reg_values_referencing_path(
@@ -675,16 +785,19 @@ fn scan_registry_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
                 inst_norm,
                 false,
                 "MUI shell cache references uninstalled executable",
+                "muicache_ref",
                 &mut items,
             );
             scan_app_paths(inst_norm, &mut items);
             scan_services_referencing_path(inst_norm, &mut items);
+            scan_shell_context_menus(inst_norm, &mut items);
         }
     }
 
     items
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_reg_values_referencing_path(
     hive_name: &str,
     hkey: winreg::HKEY,
@@ -692,6 +805,7 @@ fn scan_reg_values_referencing_path(
     inst_norm: &str,
     needs_elev: bool,
     reason: &str,
+    reason_code: &str,
     out: &mut Vec<LeftoverItem>,
 ) {
     let root = RegKey::predef(hkey);
@@ -702,17 +816,18 @@ fn scan_reg_values_referencing_path(
         let name_norm = val_name.replace('/', "\\").to_lowercase();
         let data_norm = val.to_string().replace('/', "\\").to_lowercase();
         if name_norm.contains(inst_norm) || data_norm.contains(inst_norm) {
-            out.push(LeftoverItem {
-                id: Uuid::new_v4().to_string(),
-                kind: LeftoverKind::RegistryValue,
-                path: format!("{}\\{}", hive_name, subkey),
-                value_name: Some(val_name),
-                size_bytes: 0,
-                confidence: ConfidenceLevel::High,
-                reason: reason.to_string(),
-                selected_by_default: true,
-                requires_elevation: needs_elev,
-            });
+            out.push(make_item(
+                LeftoverKind::RegistryValue,
+                format!("{}\\{}", hive_name, subkey),
+                Some(val_name),
+                0,
+                ConfidenceLevel::High,
+                reason.to_string(),
+                reason_code,
+                None,
+                true,
+                needs_elev,
+            ));
         }
     }
 }
@@ -734,17 +849,18 @@ fn scan_app_paths(inst_norm: &str, out: &mut Vec<LeftoverItem>) {
                 let d_norm = default_val.replace('/', "\\").to_lowercase();
                 let p_norm = path_val.replace('/', "\\").to_lowercase();
                 if d_norm.contains(inst_norm) || p_norm.contains(inst_norm) {
-                    out.push(LeftoverItem {
-                        id: Uuid::new_v4().to_string(),
-                        kind: LeftoverKind::RegistryKey,
-                        path: format!("{}\\{}\\{}", hive_name, base_sub, exe_key_name),
-                        value_name: None,
-                        size_bytes: 0,
-                        confidence: ConfidenceLevel::High,
-                        reason: "App Paths registration references uninstalled directory".to_string(),
-                        selected_by_default: true,
-                        requires_elevation: needs_elev,
-                    });
+                    out.push(make_item(
+                        LeftoverKind::RegistryKey,
+                        format!("{}\\{}\\{}", hive_name, base_sub, exe_key_name),
+                        None,
+                        0,
+                        ConfidenceLevel::High,
+                        "App Paths registration references uninstalled directory".to_string(),
+                        "app_paths_ref",
+                        None,
+                        true,
+                        needs_elev,
+                    ));
                 }
             }
         }
@@ -762,54 +878,189 @@ fn scan_services_referencing_path(inst_norm: &str, out: &mut Vec<LeftoverItem>) 
             let img: String = sub.get_value("ImagePath").unwrap_or_default();
             let norm = img.replace('/', "\\").to_lowercase();
             if !norm.is_empty() && norm.contains(inst_norm) {
-                out.push(LeftoverItem {
-                    id: Uuid::new_v4().to_string(),
-                    kind: LeftoverKind::Service,
-                    path: format!("HKLM\\{}\\{}", base_sub, svc_name),
-                    value_name: None,
-                    size_bytes: 0,
-                    confidence: ConfidenceLevel::Medium,
-                    reason: format!("Windows Service '{}' references application folder", svc_name),
-                    selected_by_default: false,
-                    requires_elevation: true,
-                });
+                out.push(make_item(
+                    LeftoverKind::Service,
+                    format!("HKLM\\{}\\{}", base_sub, svc_name),
+                    None,
+                    0,
+                    ConfidenceLevel::Medium,
+                    format!("Windows Service '{}' references application folder", svc_name),
+                    "service_ref",
+                    Some(svc_name),
+                    false,
+                    true,
+                ));
             }
         }
     }
+}
+
+/// Scan Explorer shell context menu verbs & `Applications\<exe>` file associations under
+/// HKCU\Software\Classes and HKLM\SOFTWARE\Classes referencing `inst_norm`.
+fn scan_shell_context_menus(inst_norm: &str, out: &mut Vec<LeftoverItem>) {
+    let shell_parents = [
+        "Software\\Classes\\*\\shell",
+        "Software\\Classes\\Directory\\shell",
+        "Software\\Classes\\Directory\\Background\\shell",
+    ];
+    for (hive_name, hkey, needs_elev) in [
+        ("HKCU", HKEY_CURRENT_USER, false),
+        ("HKLM", HKEY_LOCAL_MACHINE, true),
+    ] {
+        let root = RegKey::predef(hkey);
+        for parent_sub in shell_parents {
+            let Ok(parent_key) = root.open_subkey_with_flags(parent_sub, KEY_READ) else {
+                continue;
+            };
+            for verb in parent_key.enum_keys().flatten() {
+                if verb.starts_with("Unbind") {
+                    continue;
+                }
+                let Ok(verb_key) = parent_key.open_subkey_with_flags(&verb, KEY_READ) else {
+                    continue;
+                };
+                let icon: String = verb_key.get_value("Icon").unwrap_or_default();
+                let cmd: String = verb_key
+                    .open_subkey_with_flags("command", KEY_READ)
+                    .ok()
+                    .and_then(|c| c.get_value("").ok())
+                    .unwrap_or_default();
+
+                let icon_norm = icon.replace('/', "\\").to_lowercase();
+                let cmd_norm = cmd.replace('/', "\\").to_lowercase();
+                if cmd_norm.contains(inst_norm) || icon_norm.contains(inst_norm) {
+                    let full_sub = format!("{}\\{}", parent_sub, verb);
+                    if !is_protected_registry_key(hive_name, &full_sub) {
+                        out.push(make_item(
+                            LeftoverKind::RegistryKey,
+                            format!("{}\\{}", hive_name, full_sub),
+                            None,
+                            0,
+                            ConfidenceLevel::High,
+                            format!("Explorer context menu '{}' references application", verb),
+                            "shell_context_menu",
+                            Some(verb),
+                            true,
+                            needs_elev,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Check Software\Classes\Applications\<exe>\shell\open\command
+        let apps_sub = "Software\\Classes\\Applications";
+        if let Ok(apps_key) = root.open_subkey_with_flags(apps_sub, KEY_READ) {
+            for exe_key in apps_key.enum_keys().flatten() {
+                let cmd_path = format!("{}\\shell\\open\\command", exe_key);
+                let cmd: String = apps_key
+                    .open_subkey_with_flags(&cmd_path, KEY_READ)
+                    .ok()
+                    .and_then(|k| k.get_value("").ok())
+                    .unwrap_or_default();
+                if cmd.replace('/', "\\").to_lowercase().contains(inst_norm) {
+                    let full_sub = format!("{}\\{}", apps_sub, exe_key);
+                    if !is_protected_registry_key(hive_name, &full_sub) {
+                        out.push(make_item(
+                            LeftoverKind::RegistryKey,
+                            format!("{}\\{}", hive_name, full_sub),
+                            None,
+                            0,
+                            ConfidenceLevel::High,
+                            format!("File association '{}' references application", exe_key),
+                            "file_association_ref",
+                            Some(exe_key),
+                            true,
+                            needs_elev,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Scan third-party Windows Scheduled Tasks whose command targets the application directory
+/// or whose task name matches the application anchor.
+fn scan_scheduled_task_leftovers(anchors: &SearchAnchors) -> Vec<LeftoverItem> {
+    let mut items = Vec::new();
+    let tasks = enumerate_third_party_scheduled_tasks();
+    for task in tasks {
+        let cmd_norm = task.command.replace('/', "\\").to_lowercase();
+        let exe_norm = task.executable_path.replace('/', "\\").to_lowercase();
+
+        if let Some(inst_norm) = &anchors.install_dir_norm {
+            if inst_norm.len() >= 8
+                && (cmd_norm.contains(inst_norm) || exe_norm.contains(inst_norm))
+            {
+                items.push(make_item(
+                    LeftoverKind::ScheduledTask,
+                    task.task_path,
+                    None,
+                    0,
+                    ConfidenceLevel::High,
+                    format!("Scheduled task '{}' targets application directory", task.name),
+                    "scheduled_task_ref",
+                    Some(task.name),
+                    true,
+                    true,
+                ));
+                continue;
+            }
+        }
+
+        if let Some(hit) = anchors.match_name(&task.name) {
+            items.push(make_item(
+                LeftoverKind::ScheduledTask,
+                task.task_path,
+                None,
+                0,
+                ConfidenceLevel::Medium,
+                format!("Scheduled task name matches ({})", hit.reason),
+                "scheduled_task_name",
+                Some(task.name),
+                false,
+                true,
+            ));
+        }
+    }
+    items
 }
 
 fn append_trace_leftovers(trace: &InstallTrace, out: &mut Vec<LeftoverItem>) {
     for dir_str in &trace.added_dirs {
         let p = Path::new(dir_str);
         if p.exists() && !is_protected_path(p) {
-            out.push(LeftoverItem {
-                id: Uuid::new_v4().to_string(),
-                kind: LeftoverKind::Directory,
-                path: dir_str.clone(),
-                value_name: None,
-                size_bytes: compute_dir_size_bounded(p, 2000),
-                confidence: ConfidenceLevel::High,
-                reason: "Captured by Install Tracker".to_string(),
-                selected_by_default: true,
-                requires_elevation: path_likely_needs_elevation(p),
-            });
+            out.push(make_item(
+                LeftoverKind::Directory,
+                dir_str.clone(),
+                None,
+                compute_dir_size_bounded(p, 2000),
+                ConfidenceLevel::High,
+                "Captured by Install Tracker".to_string(),
+                "tracked_install",
+                None,
+                true,
+                path_likely_needs_elevation(p),
+            ));
         }
     }
     for file_str in &trace.added_files {
         let p = Path::new(file_str);
         if p.exists() && p.is_file() && !is_protected_path(p) {
             let sz = fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            out.push(LeftoverItem {
-                id: Uuid::new_v4().to_string(),
-                kind: LeftoverKind::File,
-                path: file_str.clone(),
-                value_name: None,
-                size_bytes: sz,
-                confidence: ConfidenceLevel::High,
-                reason: "Captured by Install Tracker".to_string(),
-                selected_by_default: true,
-                requires_elevation: path_likely_needs_elevation(p),
-            });
+            out.push(make_item(
+                LeftoverKind::File,
+                file_str.clone(),
+                None,
+                sz,
+                ConfidenceLevel::High,
+                "Captured by Install Tracker".to_string(),
+                "tracked_install",
+                None,
+                true,
+                path_likely_needs_elevation(p),
+            ));
         }
     }
     for reg_key in &trace.added_registry_keys {
@@ -817,17 +1068,18 @@ fn append_trace_leftovers(trace: &InstallTrace, out: &mut Vec<LeftoverItem>) {
             if !is_protected_registry_key(&hive, &sub) {
                 if let Ok(root) = open_predef_hive(&hive) {
                     if root.open_subkey_with_flags(&sub, KEY_READ).is_ok() {
-                        out.push(LeftoverItem {
-                            id: Uuid::new_v4().to_string(),
-                            kind: LeftoverKind::RegistryKey,
-                            path: reg_key.clone(),
-                            value_name: None,
-                            size_bytes: 0,
-                            confidence: ConfidenceLevel::High,
-                            reason: "Captured by Install Tracker".to_string(),
-                            selected_by_default: true,
-                            requires_elevation: hive.eq_ignore_ascii_case("HKLM"),
-                        });
+                        out.push(make_item(
+                            LeftoverKind::RegistryKey,
+                            reg_key.clone(),
+                            None,
+                            0,
+                            ConfidenceLevel::High,
+                            "Captured by Install Tracker".to_string(),
+                            "tracked_install",
+                            None,
+                            true,
+                            hive.eq_ignore_ascii_case("HKLM"),
+                        ));
                     }
                 }
             }
@@ -838,21 +1090,56 @@ fn append_trace_leftovers(trace: &InstallTrace, out: &mut Vec<LeftoverItem>) {
             if let Ok(root) = open_predef_hive(&hive) {
                 if let Ok(k) = root.open_subkey_with_flags(&sub, KEY_READ) {
                     if k.get_raw_value(&reg_val.value_name).is_ok() {
-                        out.push(LeftoverItem {
-                            id: Uuid::new_v4().to_string(),
-                            kind: LeftoverKind::RegistryValue,
-                            path: reg_val.key_path.clone(),
-                            value_name: Some(reg_val.value_name.clone()),
-                            size_bytes: 0,
-                            confidence: ConfidenceLevel::High,
-                            reason: "Captured by Install Tracker".to_string(),
-                            selected_by_default: true,
-                            requires_elevation: hive.eq_ignore_ascii_case("HKLM"),
-                        });
+                        out.push(make_item(
+                            LeftoverKind::RegistryValue,
+                            reg_val.key_path.clone(),
+                            Some(reg_val.value_name.clone()),
+                            0,
+                            ConfidenceLevel::High,
+                            "Captured by Install Tracker".to_string(),
+                            "tracked_install",
+                            None,
+                            true,
+                            hive.eq_ignore_ascii_case("HKLM"),
+                        ));
                     }
                 }
             }
         }
+    }
+    for svc_path in &trace.added_services {
+        if let Some((hive, sub)) = split_registry_path(svc_path) {
+            if let Ok(root) = open_predef_hive(&hive) {
+                if root.open_subkey_with_flags(&sub, KEY_READ).is_ok() {
+                    out.push(make_item(
+                        LeftoverKind::Service,
+                        svc_path.clone(),
+                        None,
+                        0,
+                        ConfidenceLevel::High,
+                        "Service captured by Install Tracker".to_string(),
+                        "tracked_service",
+                        None,
+                        true,
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+    for task_path in &trace.added_scheduled_tasks {
+        out.push(make_item(
+            LeftoverKind::ScheduledTask,
+            task_path.clone(),
+            None,
+            0,
+            ConfidenceLevel::High,
+            "Scheduled task captured by Install Tracker".to_string(),
+            "tracked_task",
+            None,
+            true,
+            true,
+        ));
     }
 }
 
@@ -927,9 +1214,12 @@ mod tests {
             is_valid_entry: true,
             has_uninstaller: true,
             tracked_trace_id: None,
+            package_manager: PackageManagerKind::None,
+            size_measured: false,
         };
         let anchors = SearchAnchors::from_app(&app);
-        assert!(anchors.match_name("Obsidian").is_some());
+        let hit = anchors.match_name("Obsidian").unwrap();
+        assert_eq!(hit.reason_code, "exact_install_folder");
         assert!(anchors.match_name("Microsoft").is_none());
         assert!(anchors.match_name("Windows").is_none());
         assert!(anchors.match_name("Temp").is_none());

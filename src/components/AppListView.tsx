@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  ArrowDown,
   ArrowDownUp,
+  ArrowUp,
   Check,
   CheckSquare,
   ChevronDown,
+  Copy,
   Download,
   ExternalLink,
   FolderOpen,
@@ -14,6 +17,7 @@ import {
   Package,
   RefreshCw,
   Search,
+  Sparkles,
   Trash2,
   X,
   Zap,
@@ -22,12 +26,15 @@ import { api } from "../api/client";
 import type { Dict } from "../i18n";
 import type {
   AppFilterMode,
+  AppListViewState,
   AppSettings,
   AppSortField,
   ExportFormat,
   InstalledApp,
+  PackageManagerKind,
 } from "../types";
-import { filterAndSortApps, formatSizeKb } from "../utils/format";
+import { computeFilterCounts, filterAndSortApps, formatSizeKb } from "../utils/format";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface AppListViewProps {
   dict: Dict;
@@ -35,15 +42,31 @@ interface AppListViewProps {
   loading: boolean;
   storeOnly: boolean;
   settings: AppSettings;
+  viewState: AppListViewState;
+  onChangeViewState: (updater: (prev: AppListViewState) => AppListViewState) => void;
   icons: Record<string, string>;
   onRequestIcons: (ids: string[]) => void;
   onRefresh: () => void;
   onUninstall: (app: InstalledApp, quiet: boolean) => void;
   onForceUninstall: (app?: InstalledApp) => void;
   onBatchUninstall: (apps: InstalledApp[], quiet: boolean) => void;
+  onCleanBrokenEntries: (brokenApps: InstalledApp[]) => Promise<void>;
   onExport: (format: ExportFormat, visibleApps: InstalledApp[]) => void;
   onCheckLocks: (app: InstalledApp) => void;
   onNotify: (kind: "info" | "success" | "warning" | "error", title: string, detail?: string) => void;
+}
+
+function packageManagerBadge(pm?: PackageManagerKind): string | null {
+  switch (pm) {
+    case "scoop":
+      return "Scoop";
+    case "chocolatey":
+      return "Choco";
+    case "winget":
+      return "Winget";
+    default:
+      return null;
+  }
 }
 
 export function AppListView({
@@ -52,25 +75,30 @@ export function AppListView({
   loading,
   storeOnly,
   settings,
+  viewState,
+  onChangeViewState,
   icons,
   onRequestIcons,
   onRefresh,
   onUninstall,
   onForceUninstall,
   onBatchUninstall,
+  onCleanBrokenEntries,
   onExport,
   onCheckLocks,
   onNotify,
 }: AppListViewProps) {
-  const [query, setQuery] = useState("");
-  const [filterMode, setFilterMode] = useState<AppFilterMode>("all");
-  const [sortField, setSortField] = useState<AppSortField>("name");
-  const [sortDesc, setSortDesc] = useState(false);
+  const { query, filterMode, sortField, sortDesc } = viewState;
+
   const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
   const [batchMode, setBatchMode] = useState(false);
   const [batchIds, setBatchIds] = useState<Set<string>>(new Set());
+  const lastBatchIdxRef = useRef<number | null>(null);
+
   const [exportOpen, setExportOpen] = useState(false);
   const [sortOpen, setSortOpen] = useState(false);
+  const [confirmCleanBroken, setConfirmCleanBroken] = useState(false);
+  const [cleaningBroken, setCleaningBroken] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -80,33 +108,24 @@ export function AppListView({
   const searchRef = useRef<HTMLInputElement>(null);
   const parentRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
-        e.preventDefault();
-        searchRef.current?.focus();
-      } else if (e.key === "F5") {
-        e.preventDefault();
-        onRefresh();
-      } else if (e.key === "Escape") {
-        setContextMenu(null);
-        setExportOpen(false);
-        setSortOpen(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onRefresh]);
+  const setQuery = (next: string) =>
+    onChangeViewState((prev) => ({ ...prev, query: next }));
+  const setFilterMode = (next: AppFilterMode) =>
+    onChangeViewState((prev) => ({ ...prev, filterMode: next }));
+  const setSortField = (next: AppSortField) =>
+    onChangeViewState((prev) => ({ ...prev, sortField: next }));
+  const toggleSortDesc = () =>
+    onChangeViewState((prev) => ({ ...prev, sortDesc: !prev.sortDesc }));
 
-  useEffect(() => {
-    const dismiss = () => {
-      setContextMenu(null);
-      setExportOpen(false);
-      setSortOpen(false);
-    };
-    window.addEventListener("click", dismiss);
-    return () => window.removeEventListener("click", dismiss);
-  }, []);
+  const handleHeaderSort = (field: AppSortField) => {
+    onChangeViewState((prev) => {
+      if (prev.sortField === field) {
+        return { ...prev, sortDesc: !prev.sortDesc };
+      }
+      const defaultDesc = field === "size" || field === "date";
+      return { ...prev, sortField: field, sortDesc: defaultDesc };
+    });
+  };
 
   const visibleApps = useMemo(
     () =>
@@ -120,6 +139,17 @@ export function AppListView({
         showWindowsUpdates: settings.showWindowsUpdates,
       }),
     [apps, storeOnly, query, filterMode, sortField, sortDesc, settings],
+  );
+
+  const filterCounts = useMemo(
+    () =>
+      computeFilterCounts(apps, {
+        storeOnly,
+        query,
+        showSystemComponents: settings.showSystemComponents,
+        showWindowsUpdates: settings.showWindowsUpdates,
+      }),
+    [apps, storeOnly, query, settings],
   );
 
   const maxSizeKb = useMemo(
@@ -141,6 +171,87 @@ export function AppListView({
 
   const virtualItems = virtualizer.getVirtualItems();
 
+  // Desktop keyboard shortcuts & list navigation
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const inInput =
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.isContentEditable;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+        return;
+      }
+      if (e.key === "F5") {
+        e.preventDefault();
+        onRefresh();
+        return;
+      }
+      if (e.key === "Escape") {
+        if (contextMenu || exportOpen || sortOpen) {
+          setContextMenu(null);
+          setExportOpen(false);
+          setSortOpen(false);
+        } else if (selectedAppId) {
+          setSelectedAppId(null);
+        }
+        return;
+      }
+
+      if (inInput) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && batchMode) {
+        e.preventDefault();
+        setBatchIds(new Set(visibleApps.map((a) => a.id)));
+        return;
+      }
+
+      if (e.key === "ArrowDown" && visibleApps.length > 0) {
+        e.preventDefault();
+        const curIdx = visibleApps.findIndex((a) => a.id === selectedAppId);
+        const nextIdx = curIdx < 0 ? 0 : Math.min(visibleApps.length - 1, curIdx + 1);
+        setSelectedAppId(visibleApps[nextIdx].id);
+        virtualizer.scrollToIndex(nextIdx, { align: "auto" });
+      } else if (e.key === "ArrowUp" && visibleApps.length > 0) {
+        e.preventDefault();
+        const curIdx = visibleApps.findIndex((a) => a.id === selectedAppId);
+        const nextIdx = curIdx <= 0 ? 0 : curIdx - 1;
+        setSelectedAppId(visibleApps[nextIdx].id);
+        virtualizer.scrollToIndex(nextIdx, { align: "auto" });
+      } else if (e.key === "Delete" && selectedApp) {
+        e.preventDefault();
+        onUninstall(selectedApp, false);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [
+    onRefresh,
+    contextMenu,
+    exportOpen,
+    sortOpen,
+    selectedAppId,
+    selectedApp,
+    batchMode,
+    visibleApps,
+    virtualizer,
+    onUninstall,
+  ]);
+
+  useEffect(() => {
+    const dismiss = () => {
+      setContextMenu(null);
+      setExportOpen(false);
+      setSortOpen(false);
+    };
+    window.addEventListener("click", dismiss);
+    return () => window.removeEventListener("click", dismiss);
+  }, []);
+
   // Lazily request native PNG icons only for rows currently near the viewport.
   useEffect(() => {
     if (virtualItems.length === 0) return;
@@ -156,19 +267,50 @@ export function AppListView({
     }
   }, [virtualItems, visibleApps, icons, onRequestIcons]);
 
-  const toggleBatchId = (id: string) => {
-    setBatchIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const toggleBatchAt = (index: number, shiftKey: boolean) => {
+    const target = visibleApps[index];
+    if (!target) return;
+
+    if (shiftKey && lastBatchIdxRef.current !== null) {
+      const start = Math.min(lastBatchIdxRef.current, index);
+      const end = Math.max(lastBatchIdxRef.current, index);
+      setBatchIds((prev) => {
+        const next = new Set(prev);
+        for (let i = start; i <= end; i++) {
+          const item = visibleApps[i];
+          if (item) next.add(item.id);
+        }
+        return next;
+      });
+    } else {
+      setBatchIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(target.id)) next.delete(target.id);
+        else next.add(target.id);
+        return next;
+      });
+      lastBatchIdxRef.current = index;
+    }
   };
 
   const selectedBatchApps = useMemo(
     () => visibleApps.filter((a) => batchIds.has(a.id)),
     [visibleApps, batchIds],
   );
+
+  const cleanableBrokenApps = useMemo(
+    () => visibleApps.filter((a) => !a.isValidEntry && Boolean(a.registryKey)),
+    [visibleApps],
+  );
+
+  const handleCopyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      onNotify("success", dict.common.copied, text);
+    } catch {
+      // Ignore clipboard failure
+    }
+  };
 
   const handleOpenFolder = async (path: string) => {
     try {
@@ -194,18 +336,18 @@ export function AppListView({
     }
   };
 
-  const filters: Array<{ id: AppFilterMode; label: string }> = storeOnly
+  const filters: Array<{ id: AppFilterMode; label: string; count: number }> = storeOnly
     ? [
-        { id: "all", label: dict.toolbar.filterAll },
-        { id: "recent", label: dict.toolbar.filterRecent },
-        { id: "system", label: dict.toolbar.filterSystem },
+        { id: "all", label: dict.toolbar.filterAll, count: filterCounts.all },
+        { id: "recent", label: dict.toolbar.filterRecent, count: filterCounts.recent },
+        { id: "system", label: dict.toolbar.filterSystem, count: filterCounts.system },
       ]
     : [
-        { id: "all", label: dict.toolbar.filterAll },
-        { id: "recent", label: dict.toolbar.filterRecent },
-        { id: "large", label: dict.toolbar.filterLarge },
-        { id: "broken", label: dict.toolbar.filterBroken },
-        { id: "system", label: dict.toolbar.filterSystem },
+        { id: "all", label: dict.toolbar.filterAll, count: filterCounts.all },
+        { id: "recent", label: dict.toolbar.filterRecent, count: filterCounts.recent },
+        { id: "large", label: dict.toolbar.filterLarge, count: filterCounts.large },
+        { id: "broken", label: dict.toolbar.filterBroken, count: filterCounts.broken },
+        { id: "system", label: dict.toolbar.filterSystem, count: filterCounts.system },
       ];
 
   const sortOptions: Array<{ id: AppSortField; label: string }> = [
@@ -217,6 +359,15 @@ export function AppListView({
 
   const currentSortLabel =
     sortOptions.find((opt) => opt.id === sortField)?.label ?? dict.toolbar.sortName;
+
+  const renderSortIcon = (field: AppSortField) => {
+    if (sortField !== field) return null;
+    return sortDesc ? (
+      <ArrowDown className="h-3 w-3 text-[var(--text-primary)]" strokeWidth={1.5} />
+    ) : (
+      <ArrowUp className="h-3 w-3 text-[var(--text-primary)]" strokeWidth={1.5} />
+    );
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-[var(--bg-canvas)]">
@@ -281,6 +432,7 @@ export function AppListView({
               onClick={() => {
                 setBatchMode((m) => !m);
                 setBatchIds(new Set());
+                lastBatchIdxRef.current = null;
               }}
               className={`h-8 px-2.5 ${batchMode ? "ui-btn-primary" : "ui-btn-ghost"}`}
             >
@@ -319,7 +471,7 @@ export function AppListView({
                       }}
                       className="flex w-full items-center rounded-[8px] px-2.5 py-1.5 text-left text-[12.5px] text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
                     >
-                      Export .{fmt.toUpperCase()}
+                      {dict.toolbar.exportFormat} .{fmt.toUpperCase()}
                     </button>
                   ))}
                 </div>
@@ -328,7 +480,7 @@ export function AppListView({
           </div>
         </div>
 
-        {/* Lightweight Flat Filter Tabs & Minimal Sort Controls */}
+        {/* Lightweight Flat Filter Tabs with Muted Counts & Sort Controls */}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-1">
             {filters.map((f) => {
@@ -338,19 +490,36 @@ export function AppListView({
                   key={f.id}
                   type="button"
                   onClick={() => setFilterMode(f.id)}
-                  className={`rounded-[8px] px-2.5 py-1 text-[12px] transition-colors duration-150 cursor-pointer ${
+                  className={`inline-flex items-center gap-1.5 rounded-[8px] px-2.5 py-1 text-[12px] transition-colors duration-150 cursor-pointer ${
                     active
                       ? "bg-[var(--bg-selected)] font-medium text-[var(--text-primary)]"
                       : "font-normal text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   }`}
                 >
-                  {f.label}
+                  <span>{f.label}</span>
+                  {f.count > 0 && (
+                    <span
+                      className={`num-tabular text-[11px] ${
+                        active ? "text-[var(--text-secondary)]" : "text-[var(--text-tertiary)]"
+                      }`}
+                    >
+                      {f.count}
+                    </span>
+                  )}
                 </button>
               );
             })}
-            <span className="num-tabular ml-2 text-[12px] text-[var(--text-tertiary)]">
-              {visibleApps.length} {dict.status.programs}
-            </span>
+
+            {!storeOnly && filterMode === "broken" && cleanableBrokenApps.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setConfirmCleanBroken(true)}
+                className="ui-btn-danger-subtle ml-1.5 h-7 px-2.5 text-[11.5px]"
+              >
+                <Sparkles className="h-3.5 w-3.5" strokeWidth={1.5} />
+                <span>{dict.toolbar.cleanAllBroken}</span>
+              </button>
+            )}
           </div>
 
           <div className="flex items-center gap-0.5">
@@ -399,15 +568,15 @@ export function AppListView({
 
             <button
               type="button"
-              onClick={() => setSortDesc((d) => !d)}
+              onClick={toggleSortDesc}
               className="ui-btn-ghost h-7 px-2 text-[11.5px]"
-              title={sortDesc ? "Descending" : "Ascending"}
+              title={sortDesc ? dict.toolbar.sortDesc : dict.toolbar.sortAsc}
             >
               <ArrowDownUp
                 className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
                 strokeWidth={1.5}
               />
-              <span className="num-tabular">{sortDesc ? "DESC" : "ASC"}</span>
+              <span>{sortDesc ? dict.toolbar.sortDesc : dict.toolbar.sortAsc}</span>
             </button>
           </div>
         </div>
@@ -415,9 +584,18 @@ export function AppListView({
         {/* Batch Action Bar (Neutral, Zero Blue) */}
         {batchMode && (
           <div className="flex items-center justify-between rounded-[10px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-3.5 py-2">
-            <span className="num-tabular text-[12.5px] font-medium text-[var(--text-primary)]">
-              {selectedBatchApps.length} {dict.toolbar.selectedCount}
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="num-tabular text-[12.5px] font-medium text-[var(--text-primary)]">
+                {selectedBatchApps.length} {dict.toolbar.selectedCount}
+              </span>
+              <button
+                type="button"
+                onClick={() => setBatchIds(new Set(visibleApps.map((a) => a.id)))}
+                className="ui-btn-ghost h-6.5 px-2 text-[11.5px]"
+              >
+                {dict.toolbar.selectAllVisible}
+              </button>
+            </div>
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
@@ -452,12 +630,39 @@ export function AppListView({
       {/* Main Content Area: Virtualized List + Optional Inspector Drawer */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <div className="flex min-w-0 flex-1 flex-col">
-          {/* Borderless Minimal Table Header (no gray fill strip) */}
+          {/* Borderless Interactive Sortable Table Header */}
           <div className="grid grid-cols-[minmax(200px,1fr)_104px_98px_108px_108px] items-center gap-3 border-b border-[var(--border-hairline)] py-2 pr-[30px] pl-6 text-[11.5px] font-medium text-[var(--text-tertiary)] select-none">
-            <div>{dict.appList.colName}</div>
+            <button
+              type="button"
+              onClick={() => handleHeaderSort("name")}
+              className="inline-flex items-center gap-1 text-left transition-colors hover:text-[var(--text-primary)] cursor-pointer"
+            >
+              <span className={sortField === "name" ? "text-[var(--text-primary)]" : ""}>
+                {dict.appList.colName}
+              </span>
+              {renderSortIcon("name")}
+            </button>
             <div>{dict.appList.colVersion}</div>
-            <div>{dict.appList.colDate}</div>
-            <div className="text-right">{dict.appList.colSize}</div>
+            <button
+              type="button"
+              onClick={() => handleHeaderSort("date")}
+              className="inline-flex items-center gap-1 text-left transition-colors hover:text-[var(--text-primary)] cursor-pointer"
+            >
+              <span className={sortField === "date" ? "text-[var(--text-primary)]" : ""}>
+                {dict.appList.colDate}
+              </span>
+              {renderSortIcon("date")}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleHeaderSort("size")}
+              className="inline-flex items-center justify-end gap-1 text-right transition-colors hover:text-[var(--text-primary)] cursor-pointer"
+            >
+              {renderSortIcon("size")}
+              <span className={sortField === "size" ? "text-[var(--text-primary)]" : ""}>
+                {dict.appList.colSize}
+              </span>
+            </button>
             <div className="text-right">{dict.appList.colActions}</div>
           </div>
 
@@ -499,6 +704,7 @@ export function AppListView({
                   const isSelected = selectedAppId === app.id;
                   const isChecked = batchIds.has(app.id);
                   const iconSrc = icons[app.id];
+                  const pmTag = packageManagerBadge(app.packageManager);
                   const sizePct =
                     app.estimatedSizeKb > 0
                       ? Math.min(
@@ -514,8 +720,8 @@ export function AppListView({
                   return (
                     <div
                       key={app.id}
-                      onClick={() => {
-                        if (batchMode) toggleBatchId(app.id);
+                      onClick={(e) => {
+                        if (batchMode) toggleBatchAt(virtualRow.index, e.shiftKey);
                         else setSelectedAppId(app.id);
                       }}
                       onDoubleClick={() => onUninstall(app, false)}
@@ -544,8 +750,11 @@ export function AppListView({
                           <input
                             type="checkbox"
                             checked={isChecked}
-                            onChange={() => toggleBatchId(app.id)}
-                            onClick={(e) => e.stopPropagation()}
+                            onChange={() => {}}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleBatchAt(virtualRow.index, e.shiftKey);
+                            }}
                             className="ui-checkbox"
                           />
                         )}
@@ -578,6 +787,11 @@ export function AppListView({
                             {!app.isValidEntry && (
                               <span className="inline-flex shrink-0 items-center rounded-full bg-[var(--danger-bg-hover)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--danger-text)]">
                                 {dict.appList.brokenBadge}
+                              </span>
+                            )}
+                            {pmTag && (
+                              <span className="shrink-0 rounded-full bg-[var(--bg-subtle)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+                                {pmTag}
                               </span>
                             )}
                             {app.kind === "msi" && (
@@ -803,18 +1017,30 @@ export function AppListView({
               />
               <MetaRow
                 label={dict.inspector.size}
-                value={formatSizeKb(selectedApp.estimatedSizeKb)}
+                value={
+                  selectedApp.sizeMeasured && selectedApp.estimatedSizeKb > 0
+                    ? `${formatSizeKb(selectedApp.estimatedSizeKb)} (${dict.inspector.sizeMeasured})`
+                    : formatSizeKb(selectedApp.estimatedSizeKb)
+                }
                 tabular
               />
               <MetaRow
                 label={dict.inspector.typeScope}
                 value={`${selectedApp.kind.toUpperCase()} / ${selectedApp.scope} / ${selectedApp.arch}`}
               />
+              {packageManagerBadge(selectedApp.packageManager) && (
+                <MetaRow
+                  label={dict.inspector.packageManager}
+                  value={packageManagerBadge(selectedApp.packageManager) ?? ""}
+                />
+              )}
               {selectedApp.installLocation && (
                 <MetaRow
                   label={dict.inspector.installLocation}
                   value={selectedApp.installLocation}
                   mono
+                  copyLabel={dict.common.copy}
+                  onCopy={() => handleCopyText(selectedApp.installLocation)}
                 />
               )}
               {selectedApp.registryKey && (
@@ -822,6 +1048,8 @@ export function AppListView({
                   label={dict.inspector.registryKey}
                   value={selectedApp.registryKey}
                   mono
+                  copyLabel={dict.common.copy}
+                  onCopy={() => handleCopyText(selectedApp.registryKey)}
                 />
               )}
               {selectedApp.productCode && (
@@ -829,6 +1057,8 @@ export function AppListView({
                   label={dict.inspector.productCode}
                   value={selectedApp.productCode}
                   mono
+                  copyLabel={dict.common.copy}
+                  onCopy={() => handleCopyText(selectedApp.productCode)}
                 />
               )}
               {selectedApp.packageFullName && (
@@ -836,6 +1066,8 @@ export function AppListView({
                   label={dict.inspector.packageName}
                   value={selectedApp.packageFullName}
                   mono
+                  copyLabel={dict.common.copy}
+                  onCopy={() => handleCopyText(selectedApp.packageFullName)}
                 />
               )}
               {selectedApp.uninstallString && (
@@ -843,6 +1075,8 @@ export function AppListView({
                   label={dict.inspector.uninstallCmd}
                   value={selectedApp.uninstallString}
                   mono
+                  copyLabel={dict.common.copy}
+                  onCopy={() => handleCopyText(selectedApp.uninstallString)}
                 />
               )}
               {selectedApp.quietUninstallString && (
@@ -850,6 +1084,8 @@ export function AppListView({
                   label={dict.inspector.quietCmd}
                   value={selectedApp.quietUninstallString}
                   mono
+                  copyLabel={dict.common.copy}
+                  onCopy={() => handleCopyText(selectedApp.quietUninstallString)}
                 />
               )}
             </div>
@@ -917,6 +1153,28 @@ export function AppListView({
           )}
         </div>
       )}
+
+      {confirmCleanBroken && (
+        <ConfirmDialog
+          title={dict.toolbar.cleanAllBrokenTitle}
+          description={dict.toolbar.cleanAllBrokenDesc}
+          detail={`${cleanableBrokenApps.length} ${dict.status.programs}`}
+          confirmLabel={dict.common.confirm}
+          cancelLabel={dict.common.cancel}
+          danger
+          busy={cleaningBroken}
+          onCancel={() => setConfirmCleanBroken(false)}
+          onConfirm={async () => {
+            setCleaningBroken(true);
+            try {
+              await onCleanBrokenEntries(cleanableBrokenApps);
+              setConfirmCleanBroken(false);
+            } finally {
+              setCleaningBroken(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -926,15 +1184,32 @@ function MetaRow({
   value,
   mono,
   tabular,
+  copyLabel,
+  onCopy,
 }: {
   label: string;
   value: string;
   mono?: boolean;
   tabular?: boolean;
+  copyLabel?: string;
+  onCopy?: () => void;
 }) {
   return (
-    <div>
-      <div className="text-[11px] font-medium text-[var(--text-tertiary)]">{label}</div>
+    <div className="group">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium text-[var(--text-tertiary)]">{label}</span>
+        {onCopy && (
+          <button
+            type="button"
+            onClick={onCopy}
+            title={copyLabel}
+            aria-label={copyLabel}
+            className="ui-btn-ghost h-5 w-5 p-0 opacity-0 transition-opacity group-hover:opacity-100"
+          >
+            <Copy className="h-3 w-3 text-[var(--text-tertiary)]" strokeWidth={1.5} />
+          </button>
+        )}
+      </div>
       <div
         className={`mt-0.5 break-all select-text ${
           mono

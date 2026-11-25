@@ -10,6 +10,10 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> | <a href="./README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/Nexusyyan/unbind/releases/latest">
     <img alt="Latest Release" src="https://img.shields.io/github/v/release/Nexusyyan/unbind?style=flat-square&color=18181b" />
   </a>
@@ -27,29 +31,30 @@
 
 Grab the latest prebuilt Windows binary from **[GitHub Releases](https://github.com/Nexusyyan/unbind/releases/latest)** (built automatically from source via GitHub Actions with `SHA256SUMS.txt`):
 
-- **Portable ZIP** (`unbind-v*-x86_64-windows-portable.zip`): Includes `unbind.exe` and `portable.json`. Extract anywhere to keep all settings, registry backups, traces, and logs inside `./unbind-data`.
+- **Portable ZIP** (`unbind-v*-x86_64-windows-portable.zip`): Includes `unbind.exe` and `portable.json`. Extract anywhere to keep all settings, registry backups, size caches, traces, and logs inside `./unbind-data`.
 - **Standalone EXE** (`unbind-v*-x86_64-windows.exe`): Single-file executable storing data under `%LOCALAPPDATA%\Unbind` (Portable Mode can be toggled anytime in Settings).
 
 ## Features
 
-- **Unified Software Discovery (Win32 / MSI / UWP Store Apps)**: Parallel discovery across 64-bit & 32-bit `HKLM` / `HKCU` Uninstall views and WinRT `PackageManager`, with native Win32/UWP icon extraction and smart filtering (All, Recent 30d, Large >100MB, Broken/Invalid entries, System Components).
-- **Step-by-Step Uninstall Wizard**: Runs vendor standard or quiet uninstallers with Windows **Job Object** process-tree monitoring, followed by parallel multi-anchor leftover scanning (Registry, AppData, ProgramData, Program Files, Start Menu/Desktop shortcuts, App Paths, MuiCache, Services).
-- **Safety Guardrails & Backups**: Hardcoded OS protection denylist (`Windows`, `System32`, critical hives/containers), confidence grading (`Safe` vs `Review`), automatic UTF-16LE `.reg` backup export before deletion, Recycle Bin deletion by default, optional Windows System Restore Point (`SRSetRestorePointW`), and `MoveFileExW` delete-on-reboot fallback.
-- **Force Removal & Restart Manager File Unlocker**: Force-clean stubborn software or any dropped `.exe` / `.lnk` / folder; inspect locking processes via Windows Restart Manager (`RmStartSession`) and terminate them safely.
-- **Batch Uninstall Queue**: Uninstall multiple applications sequentially (interactive or quiet) with a consolidated leftover cleanup review.
-- **Startup Manager**: Manage Registry `Run`/`RunOnce` (64/32-bit), Startup Folders, and third-party Scheduled Tasks with non-destructive enable/disable natively synchronized with Windows Task Manager (`StartupApproved`).
-- **Install Tracker**: Capture fast pre/post system snapshots across key filesystem and registry trees to save `.ubtrace.json` records for 100% clean tracked removal later.
-- **Privilege-Separated Portable Single Binary**: UI stays non-elevated (preserving Explorer drag-and-drop and avoiding Windows 11 WebView2 elevated profile issues), while a dual-mode `--elevated-worker` instance connects over a PID-verified Named Pipe on demand (one UAC prompt per session).
-- **Portable Mode & Export**: Drop a `portable.json` next to `unbind.exe` (or toggle in Settings) to keep all data in `./unbind-data`. Export app lists to HTML, CSV, or JSON. Bilingual UI (English / Simplified Chinese) with Light and Dark neutral themes.
+- **Unified Software Discovery & Real Disk Sizing**: Instant parallel discovery across 64/32-bit `HKLM` / `HKCU` Uninstall views and WinRT `PackageManager` (UWP/Store), with background real directory size measurement (including UWP package data) backed by an mtime-aware disk cache, package manager badges (`Scoop`, `Chocolatey`, `Winget`), clickable sortable columns, multi-token search, full keyboard navigation, and 1-click invalid entry cleanup.
+- **Step-by-Step Uninstall Wizard**: Automatically detects running target processes before launch, monitors the vendor uninstaller process tree via Windows **Job Object**, and performs parallel deep leftover scanning (Registry, AppData, ProgramData, Shortcuts, App Paths, MuiCache, Explorer Context Menus, File Associations, Scheduled Tasks, UWP package data, and Windows Services cleanly stopped & deleted via SCM).
+- **Safety Guardrails & In-App Backup Restore**: Hardcoded OS protection denylist, confidence grading (`Safe` vs `Review`), automatic UTF-16LE `.reg` backup export before deletion, in-app `.reg` preview and 1-click restore, Recycle Bin deletion by default, optional Windows System Restore Point (`SRSetRestorePointW`), and `MoveFileExW` delete-on-reboot fallback.
+- **Force Removal, Smart Drag-and-Drop & File Unlocker**: Drop any `.exe` / `.msi` installer to choose between **Force Removal** and **Track Install**, or drop folders/shortcuts for instant forced cleanup with Windows Restart Manager (`RmStartSession`) lock inspection.
+- **Hybrid Install Tracker**: Fast pre/post system snapshots supporting custom watched drives/folders, Windows Services, Scheduled Tasks, automatic installer process exit detection, and `.ubtrace.json` import/export.
+- **Startup Manager**: Manage Registry `Run`/`RunOnce` (64/32-bit), Startup Folders, and third-party Scheduled Tasks natively synced with Windows Task Manager (`StartupApproved`).
+- **Zero-UAC Explorer Integration & Native Update Check**: Register right-click Explorer context menu entries under `HKCU` with single-instance window handoff, and check GitHub Releases directly via Windows built-in `WinHTTP`.
+- **Privilege-Separated Portable Single Binary**: UI remains non-elevated while an on-demand `--elevated-worker` handles privileged tasks over a PID- and token-verified Named Pipe (one UAC prompt per session). Bilingual UI (English / Simplified Chinese) with pure neutral Light and Dark themes.
 
 ## Architecture
 
 ```text
 unbind/
 ├── assets/               # Brand & GitHub social preview assets (1280x640)
-├── crates/unbind-core/   # Decoupled Windows engine library (discovery, safety, scanner, unlocker, startup, tracker, export, ipc)
-├── src-tauri/            # Tauri v2 desktop host + Named Pipe UAC elevation bridge + dual-mode worker entrypoint
-└── src/                  # Minimalist neutral React + TypeScript + Tailwind CSS v4 frontend
+├── crates/unbind-core/   # Decoupled Windows engine (discovery, sizing, safety, scanner, unlocker, startup, tracker, shell_ext, updater, export, ipc)
+├── src-tauri/            # Tauri v2 desktop host, single-instance router, window state, Named Pipe UAC bridge
+├── src/                  # Minimalist neutral React 19 + TypeScript + Tailwind CSS v4 frontend
+├── DESIGN.md             # Canonical UI design system & brand specification
+└── AGENTS.md             # Verification commands & project invariants
 ```
 
 ## Development & Build
@@ -65,13 +70,10 @@ unbind/
 # Install frontend dependencies
 pnpm install
 
-# Run automated tests (Rust core + E2E sandbox + Frontend Vitest)
-cargo test --workspace
-pnpm test
-
-# Run Clippy & TypeScript checks
+# Run automated checks & tests
+pnpm typecheck && pnpm test
 cargo clippy --workspace --all-targets -- -D warnings
-pnpm typecheck
+cargo test --workspace
 
 # Launch in development mode
 pnpm tauri dev
@@ -80,9 +82,6 @@ pnpm tauri dev
 pnpm tauri build --no-bundle
 # Output: target/release/unbind.exe
 ```
-
-### Portable Mode
-Place an empty `portable.json` file alongside `unbind.exe` (or enable **Portable Mode** in Settings). All settings, `.reg` backups, install traces (`.ubtrace.json`), and logs are stored locally inside `unbind-data/` beside the executable.
 
 ## License
 

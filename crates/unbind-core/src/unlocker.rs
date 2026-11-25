@@ -1,4 +1,5 @@
-use crate::models::{CoreError, CoreResult, LockingProcessInfo};
+use crate::models::{CoreError, CoreResult, LockingProcessInfo, RunningProcessInfo};
+use crate::safety::{is_protected_path, normalize_fs_path};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -247,6 +248,91 @@ pub fn resolve_shortcut_target(lnk_path: &Path) -> Option<PathBuf> {
 #[cfg(not(windows))]
 pub fn resolve_shortcut_target(_lnk_path: &Path) -> Option<PathBuf> {
     None
+}
+
+/// Find running processes whose executable image resides inside `install_dir`.
+/// Used in the Uninstall Wizard prepare stage to warn the user before running a vendor uninstaller.
+#[cfg(windows)]
+pub fn find_running_processes_in_dir(install_dir: &Path) -> CoreResult<Vec<RunningProcessInfo>> {
+    use std::mem::size_of;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if is_protected_path(install_dir) || !install_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let dir_norm = normalize_fs_path(install_dir);
+    if dir_norm.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let dir_prefix = format!("{}\\", dir_norm);
+    let self_pid = std::process::id();
+
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|e| CoreError::WinApi(format!("CreateToolhelp32Snapshot failed: {}", e)))?;
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        let mut matches = Vec::new();
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let pid = entry.th32ProcessID;
+                if pid > 4 && pid != self_pid {
+                    if let Ok(proc_handle) =
+                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                    {
+                        let mut buf = [0u16; 1024];
+                        let mut len = buf.len() as u32;
+                        if QueryFullProcessImageNameW(
+                            proc_handle,
+                            PROCESS_NAME_FORMAT(0),
+                            PWSTR(buf.as_mut_ptr()),
+                            &mut len,
+                        )
+                        .is_ok()
+                            && len > 0
+                        {
+                            let exe_path = String::from_utf16_lossy(&buf[..len as usize]);
+                            let exe_norm = normalize_fs_path(Path::new(&exe_path));
+                            if exe_norm == dir_norm || exe_norm.starts_with(&dir_prefix) {
+                                let name = utf16_slice_to_string(&entry.szExeFile);
+                                matches.push(RunningProcessInfo {
+                                    pid,
+                                    name,
+                                    exe_path,
+                                });
+                            }
+                        }
+                        let _ = CloseHandle(proc_handle);
+                    }
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        matches.sort_by_key(|p| p.pid);
+        Ok(matches)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn find_running_processes_in_dir(_install_dir: &Path) -> CoreResult<Vec<RunningProcessInfo>> {
+    Ok(Vec::new())
 }
 
 #[cfg(test)]

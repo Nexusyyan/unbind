@@ -7,15 +7,19 @@ import type {
   BackupEntry,
   CleanupOptions,
   CleanupReport,
+  CliAction,
   ExportFormat,
   InstallTrace,
   InstalledApp,
   LeftoverItem,
   LockingProcessInfo,
   OperationLogEntry,
+  RunningProcessInfo,
+  ShellIntegrationStatus,
   StartupItem,
   SystemStatus,
   UninstallExecutionResult,
+  UpdateCheckResult,
 } from "../types";
 
 export function isTauriRuntime(): boolean {
@@ -31,7 +35,7 @@ export const api = {
         portableMode: true,
         dataDir: "C:\\Portable\\Unbind\\unbind-data",
         windowsVersion: "Windows 11 Preview",
-        appVersion: "0.3.0",
+        appVersion: "0.4.0",
       };
     }
     return invoke<SystemStatus>("get_system_status");
@@ -49,6 +53,7 @@ export const api = {
         showWindowsUpdates: false,
         language: "auto",
         theme: "system",
+        customTrackRoots: [],
       };
     }
     return invoke<AppSettings>("get_settings");
@@ -62,6 +67,11 @@ export const api = {
   async listApps(): Promise<InstalledApp[]> {
     if (!isTauriRuntime()) return [];
     return invoke<InstalledApp[]>("list_apps");
+  },
+
+  async resolveAppSizes(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("resolve_app_sizes");
   },
 
   async getAppIcons(appIds: string[]): Promise<Record<string, string>> {
@@ -94,6 +104,11 @@ export const api = {
     return invoke<CleanupReport>("clean_leftovers", { appName, items, options });
   },
 
+  async findRunningAppProcesses(installLocation: string): Promise<RunningProcessInfo[]> {
+    if (!isTauriRuntime() || !installLocation.trim()) return [];
+    return invoke<RunningProcessInfo[]>("find_running_app_processes", { installLocation });
+  },
+
   async checkFileLocks(paths: string[]): Promise<LockingProcessInfo[]> {
     return invoke<LockingProcessInfo[]>("check_file_locks", { paths });
   },
@@ -121,11 +136,13 @@ export const api = {
     appName: string,
     installerPath: string,
     launchInstaller: boolean,
+    extraRoots?: string[],
   ): Promise<ActiveTrackSession> {
     return invoke<ActiveTrackSession>("start_install_track", {
       appName,
       installerPath,
       launchInstaller,
+      extraRoots: extraRoots ?? [],
     });
   },
 
@@ -155,14 +172,38 @@ export const api = {
     return invoke<void>("delete_install_trace", { traceId });
   },
 
+  async exportInstallTrace(traceId: string, outputPath: string): Promise<void> {
+    return invoke<void>("export_install_trace", { traceId, outputPath });
+  },
+
+  async importInstallTrace(inputPath: string): Promise<InstallTrace> {
+    return invoke<InstallTrace>("import_install_trace", { inputPath });
+  },
+
   async listRegistryBackups(): Promise<BackupEntry[]> {
     if (!isTauriRuntime()) return [];
     return invoke<BackupEntry[]>("list_registry_backups");
   },
 
+  async previewRegistryBackup(path: string): Promise<string> {
+    return invoke<string>("preview_registry_backup", { path });
+  },
+
+  async restoreRegistryBackup(path: string): Promise<void> {
+    return invoke<void>("restore_registry_backup", { path });
+  },
+
+  async deleteRegistryBackup(path: string): Promise<void> {
+    return invoke<void>("delete_registry_backup", { path });
+  },
+
   async listOperationLogs(limit = 200): Promise<OperationLogEntry[]> {
     if (!isTauriRuntime()) return [];
     return invoke<OperationLogEntry[]>("list_operation_logs", { limit });
+  },
+
+  async clearOperationLogs(): Promise<void> {
+    return invoke<void>("clear_operation_logs");
   },
 
   async createRestorePoint(description: string): Promise<boolean> {
@@ -191,6 +232,38 @@ export const api = {
     apps?: InstalledApp[],
   ): Promise<number> {
     return invoke<number>("export_apps", { format, outputPath, apps });
+  },
+
+  async getShellIntegrationStatus(): Promise<ShellIntegrationStatus> {
+    if (!isTauriRuntime()) {
+      return {
+        forceRemoveEnabled: false,
+        trackInstallEnabled: false,
+        registeredExe: "",
+      };
+    }
+    return invoke<ShellIntegrationStatus>("get_shell_integration_status");
+  },
+
+  async setShellIntegration(
+    forceRemove: boolean,
+    trackInstall: boolean,
+    locale: string,
+  ): Promise<ShellIntegrationStatus> {
+    return invoke<ShellIntegrationStatus>("set_shell_integration", {
+      forceRemove,
+      trackInstall,
+      locale,
+    });
+  },
+
+  async checkForUpdates(): Promise<UpdateCheckResult> {
+    return invoke<UpdateCheckResult>("check_for_updates");
+  },
+
+  async takePendingCliAction(): Promise<CliAction | null> {
+    if (!isTauriRuntime()) return null;
+    return invoke<CliAction | null>("take_pending_cli_action");
   },
 
   async pickFile(filters?: Array<{ name: string; extensions: string[] }>): Promise<string | null> {
@@ -228,5 +301,9 @@ export const api = {
     close: () => (isTauriRuntime() ? getCurrentWindow().close() : Promise.resolve()),
     isMaximized: () =>
       isTauriRuntime() ? getCurrentWindow().isMaximized() : Promise.resolve(false),
+    onResized: (handler: () => void) =>
+      isTauriRuntime()
+        ? getCurrentWindow().onResized(handler)
+        : Promise.resolve(() => {}),
   },
 };

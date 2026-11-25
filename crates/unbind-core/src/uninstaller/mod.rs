@@ -281,9 +281,17 @@ pub fn execute_cleanup(
         }
     }
 
-    // Delete deeper paths / files before parent directories to minimize conflicts.
+    // Delete services & scheduled tasks first so running background services release file locks
+    // before directory removal, then delete deeper paths before parent directories.
     let mut ordered: Vec<&LeftoverItem> = items.iter().collect();
-    ordered.sort_by_key(|a| std::cmp::Reverse(a.path.len()));
+    ordered.sort_by_key(|a| {
+        let phase = match a.kind {
+            LeftoverKind::Service => 0u8,
+            LeftoverKind::ScheduledTask => 1u8,
+            _ => 2u8,
+        };
+        (phase, std::cmp::Reverse(a.path.len()))
+    });
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
@@ -293,9 +301,8 @@ pub fn execute_cleanup(
 
     for item in ordered {
         let outcome = match item.kind {
-            LeftoverKind::RegistryKey | LeftoverKind::Service => {
-                delete_registry_item(&item.path, None).map(|()| false)
-            }
+            LeftoverKind::Service => delete_windows_service(&item.path).map(|()| false),
+            LeftoverKind::RegistryKey => delete_registry_item(&item.path, None).map(|()| false),
             LeftoverKind::RegistryValue => {
                 delete_registry_item(&item.path, item.value_name.as_deref()).map(|()| false)
             }
@@ -306,10 +313,7 @@ pub fn execute_cleanup(
                     options.schedule_reboot_on_lock,
                 )
             }
-            LeftoverKind::ScheduledTask => {
-                // Delete scheduled task via schtasks if requested.
-                delete_scheduled_task(&item.path).map(|()| false)
-            }
+            LeftoverKind::ScheduledTask => delete_scheduled_task(&item.path).map(|()| false),
         };
 
         match outcome {
@@ -376,4 +380,123 @@ fn delete_scheduled_task(task_name: &str) -> CoreResult<()> {
             )))
         }
     }
+}
+
+/// Extract service short name from `HKLM\SYSTEM\CurrentControlSet\Services\<Name>` or bare `<Name>`.
+fn extract_service_name(service_ref: &str) -> Option<&str> {
+    let trimmed = service_ref.trim().trim_end_matches('\\');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let name = trimmed.rsplit('\\').next().unwrap_or(trimmed).trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("services") {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Stop and unregister a Windows Service cleanly through Service Control Manager (SCM).
+/// Falls back to registry cleanup only if SCM reports the service record no longer exists.
+#[cfg(windows)]
+fn delete_windows_service(service_ref: &str) -> CoreResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{
+        GetLastError, ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST,
+    };
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, ControlService, DeleteService, OpenSCManagerW, OpenServiceW,
+        QueryServiceStatus, SC_MANAGER_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS,
+        SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
+    };
+
+    const SERVICE_DELETE_RIGHT: u32 = 0x0001_0000; // Win32 DELETE
+
+    let svc_name = extract_service_name(service_ref)
+        .ok_or_else(|| CoreError::InvalidInput(format!("Invalid service target: {}", service_ref)))?;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(svc_name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    unsafe {
+        let scm = match OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) {
+            Ok(h) => h,
+            Err(e) => {
+                if GetLastError() == ERROR_ACCESS_DENIED {
+                    return Err(CoreError::ElevationRequired(format!(
+                        "Administrator privileges required to manage Windows Service '{}'",
+                        svc_name
+                    )));
+                }
+                return Err(CoreError::WinApi(format!(
+                    "OpenSCManagerW failed for '{}': {}",
+                    svc_name, e
+                )));
+            }
+        };
+
+        let svc_res = OpenServiceW(
+            scm,
+            PCWSTR(wide.as_ptr()),
+            SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_DELETE_RIGHT,
+        );
+
+        let svc = match svc_res {
+            Ok(h) => h,
+            Err(e) => {
+                let last = GetLastError();
+                let _ = CloseServiceHandle(scm);
+                if last == ERROR_ACCESS_DENIED {
+                    return Err(CoreError::ElevationRequired(format!(
+                        "Access denied opening service '{}'",
+                        svc_name
+                    )));
+                }
+                if last == ERROR_SERVICE_DOES_NOT_EXIST {
+                    // Orphan registry key only: clean via guarded registry deletion if full path.
+                    if service_ref.contains('\\') {
+                        return delete_registry_item(service_ref, None);
+                    }
+                    return Ok(());
+                }
+                return Err(CoreError::WinApi(format!(
+                    "OpenServiceW failed for '{}': {}",
+                    svc_name, e
+                )));
+            }
+        };
+
+        let mut status = SERVICE_STATUS::default();
+        if QueryServiceStatus(svc, &mut status).is_ok() && status.dwCurrentState != SERVICE_STOPPED
+        {
+            let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+                if QueryServiceStatus(svc, &mut status).is_ok()
+                    && status.dwCurrentState == SERVICE_STOPPED
+                {
+                    break;
+                }
+            }
+        }
+
+        let del_res = DeleteService(svc);
+        let _ = CloseServiceHandle(svc);
+        let _ = CloseServiceHandle(scm);
+
+        del_res.map_err(|e| {
+            CoreError::WinApi(format!("DeleteService failed for '{}': {}", svc_name, e))
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn delete_windows_service(_service_ref: &str) -> CoreResult<()> {
+    Ok(())
 }

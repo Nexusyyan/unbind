@@ -9,7 +9,9 @@ export function formatBytes(bytes: number): string {
     value /= 1024;
     idx++;
   }
-  return idx === 0 ? `${Math.round(value)} B` : `${value.toFixed(value >= 100 ? 0 : 1)} ${units[idx]}`;
+  return idx === 0
+    ? `${Math.round(value)} B`
+    : `${value.toFixed(value >= 100 ? 0 : 1)} ${units[idx]}`;
 }
 
 export function formatSizeKb(kb: number): string {
@@ -38,6 +40,63 @@ export function formatDateTime(iso: string): string {
   });
 }
 
+function matchesMultiTokenQuery(app: InstalledApp, tokens: string[]): boolean {
+  if (tokens.length === 0) return true;
+  const pkgTag = app.packageManager && app.packageManager !== "none" ? app.packageManager : "";
+  const hay = `${app.name} ${app.publisher} ${app.version} ${app.installLocation} ${app.packageFamilyName} ${pkgTag}`.toLowerCase();
+  return tokens.every((tok) => hay.includes(tok));
+}
+
+export function computeFilterCounts(
+  apps: InstalledApp[],
+  options: {
+    storeOnly: boolean;
+    query: string;
+    showSystemComponents: boolean;
+    showWindowsUpdates: boolean;
+  },
+): Record<AppFilterMode, number> {
+  const tokens = options.query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const counts: Record<AppFilterMode, number> = {
+    all: 0,
+    recent: 0,
+    large: 0,
+    broken: 0,
+    system: 0,
+  };
+
+  for (const app of apps) {
+    if (options.storeOnly ? app.kind !== "storeApp" : app.kind === "storeApp") {
+      continue;
+    }
+    if (!matchesMultiTokenQuery(app, tokens)) {
+      continue;
+    }
+
+    if (app.isSystemComponent || app.isWindowsUpdate) {
+      counts.system++;
+    }
+
+    const visibleInStandard =
+      (options.showSystemComponents || !app.isSystemComponent) &&
+      (options.showWindowsUpdates || !app.isWindowsUpdate);
+
+    if (visibleInStandard) {
+      counts.all++;
+      if (isRecentDate(app.installDate, 30)) counts.recent++;
+      if (app.estimatedSizeKb >= 100 * 1024) counts.large++;
+      if (!app.isValidEntry) counts.broken++;
+    }
+  }
+
+  return counts;
+}
+
 export function filterAndSortApps(
   apps: InstalledApp[],
   options: {
@@ -50,7 +109,12 @@ export function filterAndSortApps(
     showWindowsUpdates: boolean;
   },
 ): InstalledApp[] {
-  const q = options.query.trim().toLowerCase();
+  const tokens = options.query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+
   const filtered = apps.filter((app) => {
     if (options.storeOnly ? app.kind !== "storeApp" : app.kind === "storeApp") {
       return false;
@@ -73,11 +137,7 @@ export function filterAndSortApps(
       return false;
     }
 
-    if (q) {
-      const hay = `${app.name} ${app.publisher} ${app.version} ${app.installLocation} ${app.packageFamilyName}`.toLowerCase();
-      return hay.includes(q);
-    }
-    return true;
+    return matchesMultiTokenQuery(app, tokens);
   });
 
   const dir = options.sortDesc ? -1 : 1;
@@ -89,8 +149,8 @@ export function filterAndSortApps(
         return a.installDate.localeCompare(b.installDate) * dir || a.name.localeCompare(b.name);
       case "publisher":
         return (
-          (a.publisher || "zzz").toLowerCase().localeCompare((b.publisher || "zzz").toLowerCase()) * dir ||
-          a.name.localeCompare(b.name)
+          (a.publisher || "zzz").toLowerCase().localeCompare((b.publisher || "zzz").toLowerCase()) *
+            dir || a.name.localeCompare(b.name)
         );
       case "name":
       default:

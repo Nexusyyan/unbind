@@ -5,13 +5,14 @@ use crate::models::{
 use crate::safety::{
     is_protected_path, is_protected_registry_key, open_predef_hive, split_registry_path,
 };
+use crate::startup::enumerate_third_party_scheduled_tasks;
 use crate::uninstaller::leftover::{compute_dir_size_bounded, path_likely_needs_elevation};
 use chrono::Utc;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use winreg::enums::*;
 use winreg::RegKey;
@@ -22,6 +23,8 @@ pub struct SystemSnapshot {
     pub files: HashSet<String>,
     pub reg_keys: HashSet<String>,
     pub reg_values: HashSet<TrackedRegValue>,
+    pub services: HashSet<String>,
+    pub scheduled_tasks: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,10 +33,12 @@ struct RunningTrackSession {
     baseline: SystemSnapshot,
 }
 
-/// Manages active Install Tracker snapshot sessions in memory and persists completed traces.
+pub type InstallerExitCallback = Box<dyn FnOnce(String, Option<i32>) + Send + 'static>;
+
+/// Manages active hybrid Install Tracker sessions in memory and persists completed traces.
 #[derive(Default)]
 pub struct TrackerManager {
-    sessions: Mutex<HashMap<String, RunningTrackSession>>,
+    sessions: Arc<Mutex<HashMap<String, RunningTrackSession>>>,
 }
 
 impl TrackerManager {
@@ -41,12 +46,15 @@ impl TrackerManager {
         Self::default()
     }
 
-    /// Capture a fast parallel pre-install snapshot and optionally launch the installer executable.
+    /// Capture a fast parallel pre-install snapshot (including custom watched roots, Windows
+    /// services, scheduled tasks, and shell context menus) and optionally launch + monitor the installer.
     pub fn start_session(
         &self,
         app_name: &str,
         installer_path: &str,
         launch_installer: bool,
+        extra_roots: &[String],
+        on_installer_exit: Option<InstallerExitCallback>,
     ) -> CoreResult<ActiveTrackSession> {
         let clean_name = app_name.trim();
         if clean_name.is_empty() {
@@ -55,8 +63,26 @@ impl TrackerManager {
             ));
         }
 
-        let baseline = capture_system_snapshot();
+        let valid_roots: Vec<String> = extra_roots
+            .iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| {
+                let p = Path::new(r);
+                !r.is_empty() && p.is_dir() && !is_protected_path(p)
+            })
+            .collect();
+
+        let baseline = capture_system_snapshot(&valid_roots);
         let session_id = Uuid::new_v4().to_string();
+
+        let watched_proc = if launch_installer && !installer_path.trim().is_empty() {
+            launch_installer_monitored(Path::new(installer_path.trim()))?
+        } else {
+            None
+        };
+
+        let installer_pid = watched_proc.as_ref().map(|w| w.pid);
+
         let meta = ActiveTrackSession {
             session_id: session_id.clone(),
             app_name: clean_name.to_string(),
@@ -64,24 +90,48 @@ impl TrackerManager {
             started_at: Utc::now().to_rfc3339(),
             baseline_dir_count: baseline.dirs.len(),
             baseline_file_count: baseline.files.len(),
-            baseline_reg_count: baseline.reg_keys.len() + baseline.reg_values.len(),
+            baseline_reg_count: baseline.reg_keys.len()
+                + baseline.reg_values.len()
+                + baseline.services.len()
+                + baseline.scheduled_tasks.len(),
+            watched_roots: valid_roots,
+            installer_pid,
+            installer_exited: false,
         };
 
-        if launch_installer && !installer_path.trim().is_empty() {
-            launch_installer_file(Path::new(installer_path.trim()))?;
+        {
+            let mut guard = self
+                .sessions
+                .lock()
+                .map_err(|_| CoreError::WinApi("Tracker lock poisoned".to_string()))?;
+            guard.insert(
+                session_id.clone(),
+                RunningTrackSession {
+                    meta: meta.clone(),
+                    baseline,
+                },
+            );
         }
 
-        let mut guard = self
-            .sessions
-            .lock()
-            .map_err(|_| CoreError::WinApi("Tracker lock poisoned".to_string()))?;
-        guard.insert(
-            session_id,
-            RunningTrackSession {
-                meta: meta.clone(),
-                baseline,
-            },
-        );
+        // Spawn background thread watching installer process handle until exit.
+        if let Some(proc_watch) = watched_proc {
+            let sessions_arc = Arc::clone(&self.sessions);
+            let sid = session_id.clone();
+            std::thread::spawn(move || {
+                let exit_code = proc_watch.wait_and_close();
+                if let Ok(mut guard) = sessions_arc.lock() {
+                    if let Some(sess) = guard.get_mut(&sid) {
+                        sess.meta.installer_exited = true;
+                    } else {
+                        return;
+                    }
+                }
+                if let Some(cb) = on_installer_exit {
+                    cb(sid, exit_code);
+                }
+            });
+        }
+
         Ok(meta)
     }
 
@@ -115,7 +165,7 @@ impl TrackerManager {
             })?
         };
 
-        let after = capture_system_snapshot();
+        let after = capture_system_snapshot(&running.meta.watched_roots);
         let trace = compute_trace_diff(&running.meta, &running.baseline, &after);
         save_trace(&trace, traces_dir)?;
         Ok(trace)
@@ -137,7 +187,6 @@ pub fn compute_trace_diff(
         .collect();
     raw_dirs.sort_by_key(|s| s.len());
 
-    // Keep top-most newly created directories so we don't list thousands of redundant child dirs.
     let mut added_dirs: Vec<String> = Vec::new();
     for dir in raw_dirs {
         let lower = dir.to_lowercase();
@@ -200,9 +249,24 @@ pub fn compute_trace_diff(
         .cloned()
         .collect();
 
+    let mut added_services: Vec<String> = after
+        .services
+        .difference(&before.services)
+        .cloned()
+        .collect();
+    added_services.sort();
+
+    let mut added_scheduled_tasks: Vec<String> = after
+        .scheduled_tasks
+        .difference(&before.scheduled_tasks)
+        .cloned()
+        .collect();
+    added_scheduled_tasks.sort();
+
     let mut total_size_bytes = 0u64;
     for d in &added_dirs {
-        total_size_bytes = total_size_bytes.saturating_add(compute_dir_size_bounded(Path::new(d), 4000));
+        total_size_bytes =
+            total_size_bytes.saturating_add(compute_dir_size_bounded(Path::new(d), 4000));
     }
     for f in &added_files {
         if let Ok(m) = fs::metadata(f) {
@@ -220,23 +284,31 @@ pub fn compute_trace_diff(
         added_files,
         added_registry_keys,
         added_registry_values,
+        added_services,
+        added_scheduled_tasks,
+        watched_roots: meta.watched_roots.clone(),
         total_size_bytes,
     }
 }
 
-/// Capture a fast bounded snapshot across key Windows installation directories and registry trees.
-pub fn capture_system_snapshot() -> SystemSnapshot {
-    let ((dirs, files), (reg_keys, reg_values)) =
-        rayon::join(snapshot_filesystem, snapshot_registry);
+/// Capture a fast bounded snapshot across key Windows installation directories, custom watched
+/// roots, registry trees, services, and scheduled tasks.
+pub fn capture_system_snapshot(extra_roots: &[String]) -> SystemSnapshot {
+    let (((dirs, files), (reg_keys, reg_values)), (services, scheduled_tasks)) = rayon::join(
+        || rayon::join(|| snapshot_filesystem(extra_roots), snapshot_registry),
+        || rayon::join(snapshot_services, snapshot_scheduled_tasks),
+    );
     SystemSnapshot {
         dirs,
         files,
         reg_keys,
         reg_values,
+        services,
+        scheduled_tasks,
     }
 }
 
-fn snapshot_filesystem() -> (HashSet<String>, HashSet<String>) {
+fn snapshot_filesystem(extra_roots: &[String]) -> (HashSet<String>, HashSet<String>) {
     let mut roots: Vec<(PathBuf, usize)> = Vec::new();
     for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData", "APPDATA", "LOCALAPPDATA"] {
         if let Ok(v) = std::env::var(var) {
@@ -269,6 +341,13 @@ fn snapshot_filesystem() -> (HashSet<String>, HashSet<String>) {
     if let Ok(pd) = std::env::var("ProgramData") {
         let p = PathBuf::from(pd).join("Microsoft\\Windows\\Start Menu\\Programs");
         if p.is_dir() {
+            roots.push((p, 3));
+        }
+    }
+
+    for custom in extra_roots {
+        let p = PathBuf::from(custom);
+        if p.is_dir() && !is_protected_path(&p) {
             roots.push((p, 3));
         }
     }
@@ -339,6 +418,10 @@ fn snapshot_registry() -> (HashSet<String>, HashSet<TrackedRegValue>) {
             KEY_READ | KEY_WOW64_64KEY,
             1usize,
         ),
+        ("HKCU", HKEY_CURRENT_USER, "Software\\Classes\\*\\shell", KEY_READ, 1usize),
+        ("HKCU", HKEY_CURRENT_USER, "Software\\Classes\\Directory\\shell", KEY_READ, 1usize),
+        ("HKLM", HKEY_LOCAL_MACHINE, "SOFTWARE\\Classes\\*\\shell", KEY_READ, 1usize),
+        ("HKLM", HKEY_LOCAL_MACHINE, "SOFTWARE\\Classes\\Directory\\shell", KEY_READ, 1usize),
     ];
 
     for (hive, hkey, subkey, flags, depth) in targets {
@@ -348,7 +431,6 @@ fn snapshot_registry() -> (HashSet<String>, HashSet<TrackedRegValue>) {
         }
     }
 
-    // Track startup Run values specifically.
     for (hive, hkey, subkey) in [
         ("HKCU", HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
         ("HKLM", HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
@@ -370,6 +452,25 @@ fn snapshot_registry() -> (HashSet<String>, HashSet<TrackedRegValue>) {
     }
 
     (keys, values)
+}
+
+fn snapshot_services() -> HashSet<String> {
+    let mut set = HashSet::new();
+    let base_sub = "SYSTEM\\CurrentControlSet\\Services";
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(key) = root.open_subkey_with_flags(base_sub, KEY_READ) {
+        for svc in key.enum_keys().flatten() {
+            set.insert(format!("HKLM\\{}\\{}", base_sub, svc));
+        }
+    }
+    set
+}
+
+fn snapshot_scheduled_tasks() -> HashSet<String> {
+    enumerate_third_party_scheduled_tasks()
+        .into_iter()
+        .map(|t| t.task_path)
+        .collect()
 }
 
 fn walk_reg_depth(
@@ -415,11 +516,50 @@ fn is_tracker_noise_reg(path: &str) -> bool {
         || lower.contains("\\microsoft\\windows\\shell\\")
 }
 
+struct WatchedProcess {
+    pid: u32,
+    #[cfg(windows)]
+    raw_handle: usize,
+}
+
+impl WatchedProcess {
+    #[cfg(windows)]
+    fn wait_and_close(self) -> Option<i32> {
+        use std::ffi::c_void;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, WaitForSingleObject, INFINITE,
+        };
+        let handle = HANDLE(self.raw_handle as *mut c_void);
+        unsafe {
+            let _ = WaitForSingleObject(handle, INFINITE);
+            let mut code: u32 = 0;
+            let exit_code = if GetExitCodeProcess(handle, &mut code).is_ok() {
+                Some(code as i32)
+            } else {
+                None
+            };
+            let _ = CloseHandle(handle);
+            exit_code
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn wait_and_close(self) -> Option<i32> {
+        let _ = self.pid;
+        Some(0)
+    }
+}
+
 #[cfg(windows)]
-fn launch_installer_file(path: &Path) -> CoreResult<()> {
+fn launch_installer_monitored(path: &Path) -> CoreResult<Option<WatchedProcess>> {
+    use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{w, PCWSTR};
-    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::System::Threading::GetProcessId;
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     if !path.exists() {
@@ -431,27 +571,34 @@ fn launch_installer_file(path: &Path) -> CoreResult<()> {
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     unsafe {
-        let res = ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-        if (res.0 as isize) <= 32 {
-            return Err(CoreError::WinApi(format!(
-                "ShellExecuteW failed to launch installer (code {})",
-                res.0 as isize
-            )));
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: w!("open"),
+            lpFile: PCWSTR(wide.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+
+        ShellExecuteExW(&mut sei).map_err(|e| {
+            CoreError::WinApi(format!("ShellExecuteExW failed to launch installer: {}", e))
+        })?;
+
+        if !sei.hProcess.is_invalid() {
+            let pid = GetProcessId(sei.hProcess);
+            Ok(Some(WatchedProcess {
+                pid,
+                raw_handle: sei.hProcess.0 as usize,
+            }))
+        } else {
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 #[cfg(not(windows))]
-fn launch_installer_file(_path: &Path) -> CoreResult<()> {
-    Ok(())
+fn launch_installer_monitored(_path: &Path) -> CoreResult<Option<WatchedProcess>> {
+    Ok(None)
 }
 
 pub fn save_trace(trace: &InstallTrace, traces_dir: &Path) -> CoreResult<PathBuf> {
@@ -501,6 +648,44 @@ pub fn delete_trace_file(traces_dir: &Path, trace_id: &str) -> CoreResult<()> {
     Ok(())
 }
 
+/// Export an existing InstallTrace to a user-selected `.ubtrace.json` file.
+pub fn export_trace_to_file(
+    traces_dir: &Path,
+    trace_id: &str,
+    output_path: &Path,
+) -> CoreResult<()> {
+    let trace = load_trace_by_id(traces_dir, trace_id)
+        .ok_or_else(|| CoreError::NotFound(format!("Trace '{}' not found", trace_id)))?;
+    let json = serde_json::to_string_pretty(&trace)?;
+    fs::write(output_path, json)?;
+    Ok(())
+}
+
+/// Import and validate an external `.ubtrace.json` trace file into `traces_dir`.
+pub fn import_trace_from_file(input_path: &Path, traces_dir: &Path) -> CoreResult<InstallTrace> {
+    let content = fs::read_to_string(input_path)?;
+    let mut trace: InstallTrace = serde_json::from_str(&content)
+        .map_err(|e| CoreError::InvalidInput(format!("Invalid .ubtrace.json format: {}", e)))?;
+    if trace.app_name.trim().is_empty() {
+        return Err(CoreError::InvalidInput(
+            "Trace file is missing appName".to_string(),
+        ));
+    }
+    // Always assign a fresh safe UUID if missing or colliding with an existing trace.
+    let target_exists = !trace.id.trim().is_empty()
+        && traces_dir
+            .join(format!("{}.ubtrace.json", trace.id))
+            .exists();
+    if trace.id.trim().is_empty()
+        || target_exists
+        || trace.id.contains(['/', '\\', '.', ':'])
+    {
+        trace.id = Uuid::new_v4().to_string();
+    }
+    save_trace(&trace, traces_dir)?;
+    Ok(trace)
+}
+
 /// Convert an InstallTrace into concrete still-existing LeftoverItems for 1-click full rollback.
 pub fn trace_to_leftover_items(trace: &InstallTrace) -> Vec<LeftoverItem> {
     let mut items = Vec::new();
@@ -515,6 +700,8 @@ pub fn trace_to_leftover_items(trace: &InstallTrace) -> Vec<LeftoverItem> {
                 size_bytes: compute_dir_size_bounded(p, 3000),
                 confidence: ConfidenceLevel::High,
                 reason: "Added during tracked installation".to_string(),
+                reason_code: "tracked_install".to_string(),
+                reason_param: None,
                 selected_by_default: true,
                 requires_elevation: path_likely_needs_elevation(p),
             });
@@ -531,6 +718,8 @@ pub fn trace_to_leftover_items(trace: &InstallTrace) -> Vec<LeftoverItem> {
                 size_bytes: fs::metadata(p).map(|m| m.len()).unwrap_or(0),
                 confidence: ConfidenceLevel::High,
                 reason: "Added during tracked installation".to_string(),
+                reason_code: "tracked_install".to_string(),
+                reason_param: None,
                 selected_by_default: true,
                 requires_elevation: path_likely_needs_elevation(p),
             });
@@ -549,6 +738,8 @@ pub fn trace_to_leftover_items(trace: &InstallTrace) -> Vec<LeftoverItem> {
                             size_bytes: 0,
                             confidence: ConfidenceLevel::High,
                             reason: "Registry key added during tracked installation".to_string(),
+                            reason_code: "tracked_install".to_string(),
+                            reason_param: None,
                             selected_by_default: true,
                             requires_elevation: hive.eq_ignore_ascii_case("HKLM"),
                         });
@@ -570,6 +761,8 @@ pub fn trace_to_leftover_items(trace: &InstallTrace) -> Vec<LeftoverItem> {
                             size_bytes: 0,
                             confidence: ConfidenceLevel::High,
                             reason: "Registry value added during tracked installation".to_string(),
+                            reason_code: "tracked_install".to_string(),
+                            reason_param: None,
                             selected_by_default: true,
                             requires_elevation: hive.eq_ignore_ascii_case("HKLM"),
                         });
@@ -577,6 +770,42 @@ pub fn trace_to_leftover_items(trace: &InstallTrace) -> Vec<LeftoverItem> {
                 }
             }
         }
+    }
+    for svc in &trace.added_services {
+        if let Some((hive, sub)) = split_registry_path(svc) {
+            if let Ok(root) = open_predef_hive(&hive) {
+                if root.open_subkey_with_flags(&sub, KEY_READ).is_ok() {
+                    items.push(LeftoverItem {
+                        id: Uuid::new_v4().to_string(),
+                        kind: LeftoverKind::Service,
+                        path: svc.clone(),
+                        value_name: None,
+                        size_bytes: 0,
+                        confidence: ConfidenceLevel::High,
+                        reason: "Service added during tracked installation".to_string(),
+                        reason_code: "tracked_service".to_string(),
+                        reason_param: None,
+                        selected_by_default: true,
+                        requires_elevation: true,
+                    });
+                }
+            }
+        }
+    }
+    for task in &trace.added_scheduled_tasks {
+        items.push(LeftoverItem {
+            id: Uuid::new_v4().to_string(),
+            kind: LeftoverKind::ScheduledTask,
+            path: task.clone(),
+            value_name: None,
+            size_bytes: 0,
+            confidence: ConfidenceLevel::High,
+            reason: "Scheduled task added during tracked installation".to_string(),
+            reason_code: "tracked_task".to_string(),
+            reason_param: None,
+            selected_by_default: true,
+            requires_elevation: true,
+        });
     }
     items
 }
@@ -587,13 +816,15 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_trace_diff_and_persistence() {
+    fn test_trace_diff_persistence_and_import_export() {
         let dir = tempdir().unwrap();
         let before = SystemSnapshot {
             dirs: HashSet::from(["C:\\Program Files\\Existing".to_string()]),
             files: HashSet::new(),
             reg_keys: HashSet::from(["HKCU\\Software\\Existing".to_string()]),
             reg_values: HashSet::new(),
+            services: HashSet::from(["HKLM\\SYSTEM\\CurrentControlSet\\Services\\OldSvc".to_string()]),
+            scheduled_tasks: HashSet::new(),
         };
         let after = SystemSnapshot {
             dirs: HashSet::from([
@@ -614,6 +845,11 @@ mod tests {
                 key_path: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".to_string(),
                 value_name: "NewTrackedApp".to_string(),
             }]),
+            services: HashSet::from([
+                "HKLM\\SYSTEM\\CurrentControlSet\\Services\\OldSvc".to_string(),
+                "HKLM\\SYSTEM\\CurrentControlSet\\Services\\NewTrackedSvc".to_string(),
+            ]),
+            scheduled_tasks: HashSet::from(["\\NewTrackedUpdater".to_string()]),
         };
 
         let meta = ActiveTrackSession {
@@ -624,10 +860,12 @@ mod tests {
             baseline_dir_count: 1,
             baseline_file_count: 0,
             baseline_reg_count: 1,
+            watched_roots: vec!["D:\\CustomApps".into()],
+            installer_pid: None,
+            installer_exited: false,
         };
 
         let trace = compute_trace_diff(&meta, &before, &after);
-        // Nested dir & nested file inside added_dir should collapse cleanly!
         assert_eq!(trace.added_dirs, vec!["C:\\Program Files\\NewTrackedApp"]);
         assert_eq!(
             trace.added_files,
@@ -635,10 +873,23 @@ mod tests {
         );
         assert_eq!(trace.added_registry_keys, vec!["HKCU\\Software\\NewTrackedApp"]);
         assert_eq!(trace.added_registry_values.len(), 1);
+        assert_eq!(
+            trace.added_services,
+            vec!["HKLM\\SYSTEM\\CurrentControlSet\\Services\\NewTrackedSvc"]
+        );
+        assert_eq!(trace.added_scheduled_tasks, vec!["\\NewTrackedUpdater"]);
 
         save_trace(&trace, dir.path()).unwrap();
         let loaded = load_all_traces(dir.path());
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].app_name, "NewTrackedApp");
+
+        // Verify export & import assign non-colliding ID
+        let exported = dir.path().join("shared.ubtrace.json");
+        export_trace_to_file(dir.path(), &trace.id, &exported).unwrap();
+        assert!(exported.exists());
+
+        let imported = import_trace_from_file(&exported, dir.path()).unwrap();
+        assert_ne!(imported.id, trace.id);
+        assert_eq!(imported.app_name, "NewTrackedApp");
     }
 }

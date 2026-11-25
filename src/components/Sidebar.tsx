@@ -23,6 +23,7 @@ interface SidebarProps {
     backups: number;
   };
   totalSizeKb: number;
+  resolvingSizes?: boolean;
 }
 
 export function Sidebar({
@@ -31,6 +32,7 @@ export function Sidebar({
   onSelectTab,
   counts,
   totalSizeKb,
+  resolvingSizes = false,
 }: SidebarProps) {
   const mainItems: Array<{
     id: NavTab;
@@ -103,9 +105,7 @@ export function Sidebar({
 
   return (
     <aside className="flex w-[222px] shrink-0 flex-col justify-between bg-[var(--bg-sidebar)] px-2.5 pt-2 pb-3 select-none">
-      <nav className="flex flex-col gap-0.5">
-        {mainItems.map(renderNavButton)}
-      </nav>
+      <nav className="flex flex-col gap-0.5">{mainItems.map(renderNavButton)}</nav>
 
       <div className="pt-2">
         {renderNavButton({ id: "settings", label: dict.nav.settings, icon: Settings })}
@@ -122,8 +122,16 @@ export function Sidebar({
               {formatSizeKb(totalSizeKb)}
             </span>
           </div>
-          <div className="num-tabular mt-0.5 text-[11px] text-[var(--text-tertiary)]">
-            {counts.apps + counts.store} {dict.status.programs}
+          <div className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-[var(--text-tertiary)]">
+            <span className="num-tabular">
+              {counts.apps + counts.store} {dict.status.programs}
+            </span>
+            {resolvingSizes && (
+              <span className="inline-flex items-center gap-1 text-[10.5px] text-[var(--text-tertiary)]">
+                <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-tertiary)] animate-pulse" />
+                {dict.status.calculatingSizes}
+              </span>
+            )}
           </div>
 
           <p className="mt-2.5 text-[10.5px] leading-[1.45] text-[var(--text-tertiary)]">

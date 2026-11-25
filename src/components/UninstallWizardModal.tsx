@@ -1,17 +1,20 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Copy,
   Database,
   FileText,
   Folder,
   FolderOpen,
+  KeyRound,
   Link2,
   Loader2,
   Lock,
+  Search,
   ShieldCheck,
   Skull,
   Trash2,
@@ -28,8 +31,10 @@ import type {
   LeftoverItem,
   LeftoverKind,
   LockingProcessInfo,
+  RunningProcessInfo,
 } from "../types";
 import { formatBytes } from "../utils/format";
+import { formatLeftoverReason } from "../utils/leftoverReason";
 
 type WizardStage = "prepare" | "uninstalling" | "scanning" | "review" | "cleaning" | "done";
 
@@ -42,6 +47,7 @@ interface UninstallWizardModalProps {
   settings: AppSettings;
   onClose: (didModify: boolean) => void;
   onStatusRefresh: () => void;
+  onNotify?: (kind: "info" | "success" | "warning" | "error", title: string, detail?: string) => void;
 }
 
 export function UninstallWizardModal({
@@ -53,6 +59,7 @@ export function UninstallWizardModal({
   settings,
   onClose,
   onStatusRefresh,
+  onNotify,
 }: UninstallWizardModalProps) {
   const [stage, setStage] = useState<WizardStage>(
     preloadedLeftovers ? "review" : skipNative ? "scanning" : "prepare",
@@ -68,7 +75,11 @@ export function UninstallWizardModal({
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [vendorMsg, setVendorMsg] = useState<string>("");
+  const [runningProcs, setRunningProcs] = useState<RunningProcessInfo[]>([]);
+  const [closingRunning, setClosingRunning] = useState(false);
+
   const [leftovers, setLeftovers] = useState<LeftoverItem[]>(preloadedLeftovers ?? []);
+  const [leftoverQuery, setLeftoverQuery] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() =>
     new Set((preloadedLeftovers ?? []).filter((i) => i.selectedByDefault).map((i) => i.id)),
   );
@@ -78,12 +89,60 @@ export function UninstallWizardModal({
   const [report, setReport] = useState<CleanupReport | null>(null);
   const [didModify, setDidModify] = useState(false);
 
+  const isBusy = stage === "uninstalling" || stage === "scanning" || stage === "cleaning";
+
+  // Escape closes wizard when idle
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isBusy) {
+        e.preventDefault();
+        onClose(didModify);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isBusy, didModify, onClose]);
+
+  // Pre-uninstall check: detect if target application has active running processes in its folder
+  useEffect(() => {
+    if (stage === "prepare" && app.installLocation) {
+      let active = true;
+      void api
+        .findRunningAppProcesses(app.installLocation)
+        .then((procs) => {
+          if (active) setRunningProcs(procs);
+        })
+        .catch(() => {});
+      return () => {
+        active = false;
+      };
+    }
+  }, [stage, app.installLocation]);
+
   useEffect(() => {
     if (skipNative && !preloadedLeftovers) {
       void runScan();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleCloseRunning = async () => {
+    if (runningProcs.length === 0) return;
+    setClosingRunning(true);
+    setErrorMsg(null);
+    try {
+      await api.terminateLockingProcesses(runningProcs.map((p) => p.pid));
+      const remaining = await api.findRunningAppProcesses(app.installLocation);
+      setRunningProcs(remaining);
+      if (remaining.length === 0 && onNotify) {
+        onNotify("success", app.name, dict.wizard.runningClosed);
+      }
+    } catch (err) {
+      setErrorMsg(String(err));
+    } finally {
+      setClosingRunning(false);
+    }
+  };
 
   const runScan = async () => {
     setStage("scanning");
@@ -164,6 +223,16 @@ export function UninstallWizardModal({
     }
   };
 
+  const filteredLeftovers = useMemo(() => {
+    const q = leftoverQuery.trim().toLowerCase();
+    if (!q) return leftovers;
+    return leftovers.filter((item) => {
+      const localizedReason = formatLeftoverReason(item, dict);
+      const hay = `${item.path} ${item.valueName ?? ""} ${localizedReason}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [leftovers, leftoverQuery, dict]);
+
   const grouped = useMemo(() => {
     const map: Record<string, LeftoverItem[]> = {
       registry: [],
@@ -171,7 +240,7 @@ export function UninstallWizardModal({
       shortcuts: [],
       services: [],
     };
-    for (const item of leftovers) {
+    for (const item of filteredLeftovers) {
       if (item.kind === "registryKey" || item.kind === "registryValue") {
         map.registry.push(item);
       } else if (item.kind === "shortcut") {
@@ -183,7 +252,7 @@ export function UninstallWizardModal({
       }
     }
     return map;
-  }, [leftovers]);
+  }, [filteredLeftovers]);
 
   const selectedBytes = useMemo(
     () =>
@@ -202,6 +271,19 @@ export function UninstallWizardModal({
     });
   };
 
+  const toggleGroupSelection = (items: LeftoverItem[]) => {
+    const allChecked = items.every((i) => selectedIds.has(i.id));
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allChecked) {
+        items.forEach((i) => next.delete(i.id));
+      } else {
+        items.forEach((i) => next.add(i.id));
+      }
+      return next;
+    });
+  };
+
   const toggleGroup = (key: string) => {
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
@@ -209,6 +291,15 @@ export function UninstallWizardModal({
       else next.add(key);
       return next;
     });
+  };
+
+  const handleCopyPath = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      onNotify?.("success", dict.common.copied, text);
+    } catch {
+      // Ignore
+    }
   };
 
   const stepIndex =
@@ -227,11 +318,16 @@ export function UninstallWizardModal({
     dict.wizard.stepFinish,
   ];
 
-  const isBusy = stage === "uninstalling" || stage === "scanning" || stage === "cleaning";
+  const groupMeta: Array<[string, string, typeof Database]> = [
+    ["registry", dict.wizard.groupRegistry, Database],
+    ["filesystem", dict.wizard.groupFilesystem, Folder],
+    ["shortcuts", dict.wizard.groupShortcuts, Link2],
+    ["services", dict.wizard.groupServices, Wrench],
+  ];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--backdrop-scrim)] p-4 backdrop-blur-[2px]">
-      <div className="ui-modal flex max-h-[86vh] w-full max-w-[760px] flex-col overflow-hidden">
+      <div className="ui-modal flex max-h-[86vh] w-full max-w-[780px] flex-col overflow-hidden">
         <div className="flex items-start justify-between border-b border-[var(--border-hairline)] px-6 py-4">
           <div>
             <h2 className="text-[15px] font-medium text-[var(--text-primary)]">
@@ -271,7 +367,7 @@ export function UninstallWizardModal({
             type="button"
             disabled={isBusy}
             onClick={() => onClose(didModify)}
-            aria-label="Close"
+            aria-label={dict.common.close}
             className="ui-btn-ghost h-7 w-7 rounded-full p-0"
           >
             <X className="h-4 w-4 text-[var(--text-tertiary)]" strokeWidth={1.5} />
@@ -289,6 +385,41 @@ export function UninstallWizardModal({
           {stage === "prepare" && (
             <div className="space-y-4">
               <p className="text-[13px] text-[var(--text-secondary)]">{dict.wizard.confirmDesc}</p>
+
+              {/* Pre-uninstall running process warning */}
+              {runningProcs.length > 0 && (
+                <div className="rounded-[12px] border border-[var(--warning-border)] bg-[var(--warning-bg)] p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[12.5px] font-medium text-[var(--warning-text)]">
+                      {dict.wizard.runningDetected}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={closingRunning}
+                      onClick={handleCloseRunning}
+                      className="ui-btn-danger-subtle h-7 px-2.5 text-[11.5px]"
+                    >
+                      {closingRunning ? (
+                        <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.5} />
+                      ) : (
+                        <Skull className="h-3 w-3" strokeWidth={1.5} />
+                      )}
+                      {dict.wizard.closeRunning}
+                    </button>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {runningProcs.map((p) => (
+                      <span
+                        key={p.pid}
+                        className="num-tabular rounded-[6px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2 py-0.5 font-mono text-[11px] text-[var(--text-primary)]"
+                      >
+                        {p.name} (PID {p.pid})
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="space-y-1 rounded-[12px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-3.5 text-[12px]">
                 <div>
                   <span className="text-[var(--text-tertiary)]">{dict.inspector.publisher}: </span>
@@ -431,6 +562,32 @@ export function UninstallWizardModal({
                     </div>
                   </div>
 
+                  {/* Quick filter input inside leftover review */}
+                  {leftovers.length > 4 && (
+                    <div className="relative flex h-8 items-center">
+                      <Search
+                        className="pointer-events-none absolute left-3 h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                        strokeWidth={1.5}
+                      />
+                      <input
+                        type="text"
+                        value={leftoverQuery}
+                        onChange={(e) => setLeftoverQuery(e.target.value)}
+                        placeholder={dict.wizard.searchLeftoversPlaceholder}
+                        className="ui-input h-8 w-full pr-7 pl-8.5 text-[12px]"
+                      />
+                      {leftoverQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setLeftoverQuery("")}
+                          className="absolute right-2 flex h-4.5 w-4.5 items-center justify-center rounded-full text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                        >
+                          <X className="h-3 w-3" strokeWidth={1.5} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+
                   {locks.length > 0 && (
                     <div className="rounded-[12px] border border-[var(--warning-border)] bg-[var(--warning-bg)] p-3.5">
                       <div className="flex items-center justify-between">
@@ -475,93 +632,196 @@ export function UninstallWizardModal({
                   )}
 
                   <div className="space-y-2.5">
-                    {(
-                      [
-                        ["registry", "Registry Keys & Values", Database],
-                        ["filesystem", "Files & Folders", Folder],
-                        ["shortcuts", "Shortcuts", Link2],
-                        ["services", "Services & Tasks", Wrench],
-                      ] as const
-                    ).map(([groupKey, groupTitle, GroupIcon]) => {
+                    {groupMeta.map(([groupKey, groupTitle, GroupIcon]) => {
                       const items = grouped[groupKey];
                       if (items.length === 0) return null;
                       const collapsed = collapsedGroups.has(groupKey);
+                      const checkedInGroup = items.filter((i) => selectedIds.has(i.id)).length;
+                      const allChecked = checkedInGroup === items.length;
+                      const partialChecked = checkedInGroup > 0 && checkedInGroup < items.length;
+                      const groupBytes = items.reduce((acc, i) => acc + i.sizeBytes, 0);
+
                       return (
                         <div
                           key={groupKey}
                           className="overflow-hidden rounded-[12px] border border-[var(--border-hairline)]"
                         >
-                          <button
-                            type="button"
-                            onClick={() => toggleGroup(groupKey)}
-                            className="flex w-full items-center justify-between bg-[var(--bg-subtle)] px-3.5 py-2.5 text-left text-[12px] font-medium text-[var(--text-primary)] cursor-pointer"
-                          >
-                            <span className="flex items-center gap-2">
-                              {collapsed ? (
-                                <ChevronRight
-                                  className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
-                                  strokeWidth={1.5}
-                                />
-                              ) : (
-                                <ChevronDown
-                                  className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
-                                  strokeWidth={1.5}
-                                />
-                              )}
-                              <GroupIcon
-                                className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
-                                strokeWidth={1.5}
+                          <div className="flex items-center justify-between bg-[var(--bg-subtle)] px-3.5 py-2">
+                            <div className="flex items-center gap-2">
+                              <GroupCheckbox
+                                checked={allChecked}
+                                indeterminate={partialChecked}
+                                onChange={() => toggleGroupSelection(items)}
                               />
-                              <span>{groupTitle}</span>
-                              <span className="num-tabular text-[11.5px] font-normal text-[var(--text-tertiary)]">
-                                {items.length}
+                              <button
+                                type="button"
+                                onClick={() => toggleGroup(groupKey)}
+                                className="flex items-center gap-1.5 text-left text-[12px] font-medium text-[var(--text-primary)] cursor-pointer"
+                              >
+                                {collapsed ? (
+                                  <ChevronRight
+                                    className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                                    strokeWidth={1.5}
+                                  />
+                                ) : (
+                                  <ChevronDown
+                                    className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                                    strokeWidth={1.5}
+                                  />
+                                )}
+                                <GroupIcon
+                                  className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                                  strokeWidth={1.5}
+                                />
+                                <span>{groupTitle}</span>
+                                <span className="num-tabular text-[11.5px] font-normal text-[var(--text-tertiary)]">
+                                  {checkedInGroup}/{items.length}
+                                </span>
+                              </button>
+                            </div>
+                            {groupBytes > 0 && (
+                              <span className="num-tabular text-[11.5px] text-[var(--text-tertiary)]">
+                                {formatBytes(groupBytes)}
                               </span>
-                            </span>
-                          </button>
+                            )}
+                          </div>
+
                           {!collapsed && (
                             <div className="divide-y divide-[var(--border-hairline)]">
-                              {items.map((item) => (
-                                <label
-                                  key={item.id}
-                                  className="flex items-start gap-2.5 px-3.5 py-2.5 transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={selectedIds.has(item.id)}
-                                    onChange={() => toggleItem(item.id)}
-                                    className="ui-checkbox mt-0.5"
-                                  />
-                                  <div className="min-w-0 flex-1">
-                                    <div className="flex items-center gap-1.5">
-                                      <KindIcon kind={item.kind} />
-                                      <span className="truncate font-mono text-[11.5px] text-[var(--text-primary)]">
-                                        {item.valueName
-                                          ? `${item.path}  ->  [${item.valueName}]`
-                                          : item.path}
-                                      </span>
+                              {items.map((item) => {
+                                const isFs =
+                                  item.kind === "directory" ||
+                                  item.kind === "file" ||
+                                  item.kind === "shortcut";
+                                const isReg =
+                                  item.kind === "registryKey" ||
+                                  item.kind === "registryValue" ||
+                                  item.kind === "service";
+
+                                return (
+                                  <div
+                                    key={item.id}
+                                    onClick={() => toggleItem(item.id)}
+                                    className="group flex items-start gap-2.5 px-3.5 py-2.5 transition-colors hover:bg-[var(--bg-hover)] cursor-pointer"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={selectedIds.has(item.id)}
+                                      onChange={() => {}}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        toggleItem(item.id);
+                                      }}
+                                      className="ui-checkbox mt-0.5"
+                                    />
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-1.5">
+                                        <KindIcon kind={item.kind} />
+                                        <span className="truncate font-mono text-[11.5px] text-[var(--text-primary)]">
+                                          {item.valueName
+                                            ? `${item.path}  ->  [${item.valueName}]`
+                                            : item.path}
+                                        </span>
+                                      </div>
+                                      <div className="mt-1 flex items-center gap-2 text-[11px] text-[var(--text-secondary)]">
+                                        <span
+                                          className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                                            item.confidence === "high"
+                                              ? "bg-[var(--bg-subtle)] text-[var(--text-secondary)]"
+                                              : "bg-[var(--warning-bg)] text-[var(--warning-text)]"
+                                          }`}
+                                        >
+                                          {item.confidence === "high"
+                                            ? dict.wizard.confHigh
+                                            : dict.wizard.confMedium}
+                                        </span>
+                                        <span className="truncate">
+                                          {formatLeftoverReason(item, dict)}
+                                        </span>
+                                      </div>
                                     </div>
-                                    <div className="mt-1 flex items-center gap-2 text-[11px] text-[var(--text-secondary)]">
-                                      <span
-                                        className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                                          item.confidence === "high"
-                                            ? "bg-[var(--bg-subtle)] text-[var(--text-secondary)]"
-                                            : "bg-[var(--warning-bg)] text-[var(--warning-text)]"
-                                        }`}
-                                      >
-                                        {item.confidence === "high"
-                                          ? dict.wizard.confHigh
-                                          : dict.wizard.confMedium}
-                                      </span>
-                                      <span className="truncate">{item.reason}</span>
+
+                                    <div
+                                      className="flex shrink-0 items-center gap-1"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      {item.sizeBytes > 0 && (
+                                        <span className="num-tabular mr-1 text-[11.5px] font-medium text-[var(--text-secondary)]">
+                                          {formatBytes(item.sizeBytes)}
+                                        </span>
+                                      )}
+                                      <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                                        {isFs && (
+                                          <button
+                                            type="button"
+                                            title={dict.common.openDir}
+                                            aria-label={dict.common.openDir}
+                                            onClick={() =>
+                                              api
+                                                .openPathInExplorer(item.path)
+                                                .catch((e) =>
+                                                  onNotify?.(
+                                                    "error",
+                                                    dict.common.openDir,
+                                                    String(e),
+                                                  ),
+                                                )
+                                            }
+                                            className="ui-btn-ghost h-6 w-6 p-0"
+                                          >
+                                            <FolderOpen
+                                              className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                                              strokeWidth={1.5}
+                                            />
+                                          </button>
+                                        )}
+                                        {isReg && (
+                                          <button
+                                            type="button"
+                                            title={dict.appList.openRegedit}
+                                            aria-label={dict.appList.openRegedit}
+                                            onClick={() =>
+                                              api
+                                                .openKeyInRegedit(item.path)
+                                                .catch((e) =>
+                                                  onNotify?.(
+                                                    "error",
+                                                    dict.appList.openRegedit,
+                                                    String(e),
+                                                  ),
+                                                )
+                                            }
+                                            className="ui-btn-ghost h-6 w-6 p-0"
+                                          >
+                                            <KeyRound
+                                              className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                                              strokeWidth={1.5}
+                                            />
+                                          </button>
+                                        )}
+                                        <button
+                                          type="button"
+                                          title={dict.common.copy}
+                                          aria-label={dict.common.copy}
+                                          onClick={() =>
+                                            handleCopyPath(
+                                              item.valueName
+                                                ? `${item.path}\\${item.valueName}`
+                                                : item.path,
+                                            )
+                                          }
+                                          className="ui-btn-ghost h-6 w-6 p-0"
+                                        >
+                                          <Copy
+                                            className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                                            strokeWidth={1.5}
+                                          />
+                                        </button>
+                                      </div>
                                     </div>
                                   </div>
-                                  {item.sizeBytes > 0 && (
-                                    <span className="num-tabular shrink-0 text-[11.5px] font-medium text-[var(--text-secondary)]">
-                                      {formatBytes(item.sizeBytes)}
-                                    </span>
-                                  )}
-                                </label>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
                         </div>
@@ -662,11 +922,7 @@ export function UninstallWizardModal({
         <div className="flex items-center justify-between border-t border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-6 py-3.5">
           <div>
             {stage === "prepare" && app.kind !== "storeApp" && (
-              <button
-                type="button"
-                onClick={runScan}
-                className="ui-btn-ghost h-8 text-[12px]"
-              >
+              <button type="button" onClick={runScan} className="ui-btn-ghost h-8 text-[12px]">
                 {dict.wizard.skipToScan}
               </button>
             )}
@@ -733,6 +989,32 @@ export function UninstallWizardModal({
   );
 }
 
+function GroupCheckbox({
+  checked,
+  indeterminate,
+  onChange,
+}: {
+  checked: boolean;
+  indeterminate: boolean;
+  onChange: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (ref.current) {
+      ref.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={checked}
+      onChange={onChange}
+      className="ui-checkbox"
+    />
+  );
+}
+
 function CheckOption({
   checked,
   onChange,
@@ -779,6 +1061,14 @@ function KindIcon({ kind }: { kind: LeftoverKind }) {
           strokeWidth={1.5}
         />
       );
+    case "service":
+    case "scheduledTask":
+      return (
+        <Wrench
+          className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)]"
+          strokeWidth={1.5}
+        />
+      );
     default:
       return (
         <FileText
@@ -798,16 +1088,16 @@ function StatBox({
   value: string;
   tone: "danger" | "warning" | "neutral";
 }) {
-  const cls =
+  const valueClass =
     tone === "danger"
       ? "text-[var(--danger-text)]"
       : tone === "warning"
         ? "text-[var(--warning-text)]"
         : "text-[var(--text-primary)]";
   return (
-    <div className="rounded-[12px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-3.5 text-center">
-      <div className={`num-tabular text-[18px] font-medium ${cls}`}>{value}</div>
-      <div className="mt-0.5 text-[11px] text-[var(--text-tertiary)]">{label}</div>
+    <div className="rounded-[12px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-3">
+      <div className="text-[11px] text-[var(--text-tertiary)]">{label}</div>
+      <div className={`num-tabular mt-1 text-[16px] font-medium ${valueClass}`}>{value}</div>
     </div>
   );
 }

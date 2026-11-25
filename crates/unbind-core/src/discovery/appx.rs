@@ -1,4 +1,6 @@
-use crate::models::{AppKind, Arch, CoreError, CoreResult, InstallScope, InstalledApp};
+use crate::models::{
+    AppKind, Arch, CoreError, CoreResult, InstallScope, InstalledApp, PackageManagerKind,
+};
 use std::path::{Path, PathBuf};
 
 /// Discover installed UWP / MSIX Microsoft Store apps for the current user via WinRT PackageManager.
@@ -132,6 +134,8 @@ pub fn discover_appx_apps() -> Vec<InstalledApp> {
             is_valid_entry: true,
             has_uninstaller: !is_system_component,
             tracked_trace_id: None,
+            package_manager: PackageManagerKind::None,
+            size_measured: false,
         });
     }
 

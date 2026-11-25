@@ -38,10 +38,27 @@ export function TitleBar({
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
-    api.windowControls.isMaximized().then(setMaximized).catch(() => {});
+    const syncMax = () => {
+      api.windowControls.isMaximized().then(setMaximized).catch(() => {});
+    };
+    syncMax();
+
+    let unlisten: (() => void) | undefined;
+    void api.windowControls.onResized(syncMax).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
   }, []);
 
   const isPriv = Boolean(status?.isElevated || status?.workerConnected);
+  const themeLabel =
+    theme === "dark"
+      ? dict.settings.themeDark
+      : theme === "light"
+        ? dict.settings.themeLight
+        : dict.settings.themeSystem;
 
   return (
     <header
@@ -86,7 +103,7 @@ export function TitleBar({
         <button
           type="button"
           onClick={onToggleLocale}
-          title={locale === "zh-CN" ? "Switch to English" : "Switch to Chinese"}
+          title={dict.settings.langLabel}
           className="ui-btn-ghost h-7 px-2 text-[11.5px]"
         >
           <Languages className="h-3.5 w-3.5 text-[var(--text-tertiary)]" strokeWidth={1.5} />
@@ -96,8 +113,8 @@ export function TitleBar({
         <button
           type="button"
           onClick={onCycleTheme}
-          title={`Theme: ${theme}`}
-          aria-label={`Theme: ${theme}`}
+          title={`${dict.settings.themeLabel}: ${themeLabel}`}
+          aria-label={`${dict.settings.themeLabel}: ${themeLabel}`}
           className="ui-btn-ghost h-7 w-7 rounded-full p-0"
         >
           {theme === "dark" ? (

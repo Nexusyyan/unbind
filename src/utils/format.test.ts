@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { filterAndSortApps, formatBytes, formatSizeKb, isRecentDate } from "./format";
-import type { InstalledApp } from "../types";
+import { getDict } from "../i18n";
+import {
+  computeFilterCounts,
+  filterAndSortApps,
+  formatBytes,
+  formatSizeKb,
+  isRecentDate,
+} from "./format";
+import { formatLeftoverReason } from "./leftoverReason";
+import type { InstalledApp, LeftoverItem } from "../types";
 
 const sampleApps: InstalledApp[] = [
   {
@@ -29,6 +37,8 @@ const sampleApps: InstalledApp[] = [
     isValidEntry: true,
     hasUninstaller: true,
     trackedTraceId: null,
+    packageManager: "scoop",
+    sizeMeasured: false,
   },
   {
     id: "2",
@@ -56,6 +66,8 @@ const sampleApps: InstalledApp[] = [
     isValidEntry: false,
     hasUninstaller: false,
     trackedTraceId: null,
+    packageManager: "none",
+    sizeMeasured: true,
   },
 ];
 
@@ -73,7 +85,7 @@ describe("format utilities", () => {
     expect(isRecentDate("2025-01-10", 30, ref)).toBe(false);
   });
 
-  it("filters and sorts apps correctly", () => {
+  it("filters and sorts apps with multi-token query and counts", () => {
     const large = filterAndSortApps(sampleApps, {
       storeOnly: false,
       query: "",
@@ -97,5 +109,48 @@ describe("format utilities", () => {
     });
     expect(broken).toHaveLength(1);
     expect(broken[0].name).toBe("Heavy Game Engine");
+
+    const multiToken = filterAndSortApps(sampleApps, {
+      storeOnly: false,
+      query: "igor scoop",
+      filterMode: "all",
+      sortField: "name",
+      sortDesc: false,
+      showSystemComponents: false,
+      showWindowsUpdates: false,
+    });
+    expect(multiToken).toHaveLength(1);
+    expect(multiToken[0].id).toBe("1");
+
+    const counts = computeFilterCounts(sampleApps, {
+      storeOnly: false,
+      query: "",
+      showSystemComponents: false,
+      showWindowsUpdates: false,
+    });
+    expect(counts.all).toBe(2);
+    expect(counts.large).toBe(1);
+    expect(counts.broken).toBe(1);
+  });
+
+  it("localizes structured leftover reason codes in both locales", () => {
+    const en = getDict("en");
+    const zh = getDict("zh-CN");
+    const sample: LeftoverItem = {
+      id: "l1",
+      kind: "service",
+      path: "HKLM\\SYSTEM\\CurrentControlSet\\Services\\DemoSvc",
+      valueName: null,
+      sizeBytes: 0,
+      confidence: "medium",
+      reason: "Fallback reason",
+      reasonCode: "service_ref",
+      reasonParam: "DemoSvc",
+      selectedByDefault: false,
+      requiresElevation: true,
+    };
+    expect(formatLeftoverReason(sample, en)).toContain("DemoSvc");
+    expect(formatLeftoverReason(sample, zh)).toContain("DemoSvc");
+    expect(formatLeftoverReason(sample, zh)).not.toBe("Fallback reason");
   });
 });

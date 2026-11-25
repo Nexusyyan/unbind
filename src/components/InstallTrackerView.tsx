@@ -1,26 +1,35 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Activity,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Database,
+  Download,
   FileSearch,
   Folder,
+  FolderPlus,
   Loader2,
   Play,
   Square,
   Trash2,
+  Upload,
+  Wrench,
   X,
 } from "lucide-react";
 import { api } from "../api/client";
 import type { Dict } from "../i18n";
 import type { ActiveTrackSession, InstallTrace, InstalledApp, LeftoverItem } from "../types";
 import { formatBytes, formatDateTime } from "../utils/format";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface InstallTrackerViewProps {
   dict: Dict;
   activeSessions: ActiveTrackSession[];
   traces: InstallTrace[];
+  defaultExtraRoots: string[];
+  prefillInstallerPath?: string | null;
+  onConsumePrefill?: () => void;
   onRefresh: () => void;
   onTrackedUninstall: (syntheticApp: InstalledApp, leftovers: LeftoverItem[]) => void;
   onNotify: (kind: "info" | "success" | "warning" | "error", title: string, detail?: string) => void;
@@ -30,16 +39,38 @@ export function InstallTrackerView({
   dict,
   activeSessions,
   traces,
+  defaultExtraRoots,
+  prefillInstallerPath,
+  onConsumePrefill,
   onRefresh,
   onTrackedUninstall,
   onNotify,
 }: InstallTrackerViewProps) {
   const [appName, setAppName] = useState("");
   const [installerPath, setInstallerPath] = useState("");
+  const [extraRoots, setExtraRoots] = useState<string[]>(defaultExtraRoots);
   const [launchInstaller, setLaunchInstaller] = useState(true);
   const [starting, setStarting] = useState(false);
   const [finishingId, setFinishingId] = useState<string | null>(null);
   const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null);
+  const [pendingDeleteTrace, setPendingDeleteTrace] = useState<InstallTrace | null>(null);
+
+  useEffect(() => {
+    setExtraRoots(defaultExtraRoots);
+  }, [defaultExtraRoots]);
+
+  useEffect(() => {
+    if (prefillInstallerPath) {
+      setInstallerPath(prefillInstallerPath);
+      const base =
+        prefillInstallerPath
+          .split(/[\\/]/)
+          .pop()
+          ?.replace(/\.(exe|msi|msix|bat)$/i, "") ?? "";
+      if (base) setAppName(base);
+      onConsumePrefill?.();
+    }
+  }, [prefillInstallerPath, onConsumePrefill]);
 
   const handleBrowse = async () => {
     const picked = await api.pickFile([
@@ -54,11 +85,23 @@ export function InstallTrackerView({
     }
   };
 
+  const handleAddExtraRoot = async () => {
+    const picked = await api.pickFolder();
+    if (picked && !extraRoots.some((r) => r.toLowerCase() === picked.toLowerCase())) {
+      setExtraRoots((prev) => [...prev, picked]);
+    }
+  };
+
   const handleStart = async () => {
     if (!appName.trim()) return;
     setStarting(true);
     try {
-      await api.startInstallTrack(appName.trim(), installerPath.trim(), launchInstaller);
+      await api.startInstallTrack(
+        appName.trim(),
+        installerPath.trim(),
+        launchInstaller,
+        extraRoots,
+      );
       onNotify("success", dict.tracker.activeTitle, appName.trim());
       setAppName("");
       setInstallerPath("");
@@ -99,7 +142,7 @@ export function InstallTrackerView({
       const leftovers = await api.getTraceLeftovers(trace.id);
       const synthetic: InstalledApp = {
         id: `trace:${trace.id}`,
-        name: `${trace.appName} (Tracked)`,
+        name: `${trace.appName} (${dict.appList.trackedBadge})`,
         publisher: "",
         version: "",
         installDate: trace.completedAt.slice(0, 10),
@@ -130,9 +173,35 @@ export function InstallTrackerView({
     }
   };
 
-  const handleDeleteTrace = async (traceId: string) => {
+  const handleImportTrace = async () => {
+    const picked = await api.pickFile([{ name: "Unbind Trace", extensions: ["json"] }]);
+    if (!picked) return;
     try {
-      await api.deleteInstallTrace(traceId);
+      const imported = await api.importInstallTrace(picked);
+      onNotify("success", dict.tracker.importedToast, imported.appName);
+      onRefresh();
+    } catch (err) {
+      onNotify("error", dict.tracker.importTrace, String(err));
+    }
+  };
+
+  const handleExportTrace = async (trace: InstallTrace) => {
+    const safeName = trace.appName.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 40) || "trace";
+    const dest = await api.pickSavePath(`${safeName}.ubtrace.json`, "json");
+    if (!dest) return;
+    try {
+      await api.exportInstallTrace(trace.id, dest);
+      onNotify("success", dict.tracker.exportedToast, dest);
+    } catch (err) {
+      onNotify("error", dict.tracker.exportTrace, String(err));
+    }
+  };
+
+  const confirmDeleteTrace = async () => {
+    if (!pendingDeleteTrace) return;
+    try {
+      await api.deleteInstallTrace(pendingDeleteTrace.id);
+      setPendingDeleteTrace(null);
       onRefresh();
     } catch (err) {
       onNotify("error", dict.tracker.title, String(err));
@@ -142,58 +211,88 @@ export function InstallTrackerView({
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto bg-[var(--bg-canvas)] px-6 pt-5 pb-10">
       <div className="w-full max-w-[920px] space-y-6">
-        <div>
-          <h1 className="text-[17px] font-medium tracking-[-0.015em] text-[var(--text-primary)]">
-            {dict.tracker.title}
-          </h1>
-          <p className="mt-0.5 text-[12.5px] text-[var(--text-secondary)]">
-            {dict.tracker.subtitle}
-          </p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h1 className="text-[17px] font-medium tracking-[-0.015em] text-[var(--text-primary)]">
+              {dict.tracker.title}
+            </h1>
+            <p className="mt-0.5 text-[12.5px] text-[var(--text-secondary)]">
+              {dict.tracker.subtitle}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleImportTrace}
+            className="ui-btn-ghost h-8 px-2.5"
+          >
+            <Upload className="h-3.5 w-3.5 text-[var(--text-tertiary)]" strokeWidth={1.5} />
+            <span>{dict.tracker.importTrace}</span>
+          </button>
         </div>
 
         {/* Active Sessions Banner */}
-        {activeSessions.map((sess) => (
-          <div
-            key={sess.sessionId}
-            className="space-y-3 rounded-[14px] border border-[var(--success-border)] bg-[var(--success-bg)] p-4"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <span className="h-2 w-2 rounded-full bg-[var(--success-text)] animate-pulse" />
-                <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
-                  {dict.tracker.activeTitle}: {sess.appName}
+        {activeSessions.map((sess) => {
+          const baselineText = dict.tracker.baselineSummary
+            .replace("{dirs}", String(sess.baselineDirCount))
+            .replace("{regs}", String(sess.baselineRegCount));
+          return (
+            <div
+              key={sess.sessionId}
+              className="space-y-3 rounded-[14px] border border-[var(--success-border)] bg-[var(--success-bg)] p-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-2 w-2 rounded-full bg-[var(--success-text)] ${
+                      sess.installerExited ? "" : "animate-pulse"
+                    }`}
+                  />
+                  <span className="text-[13.5px] font-medium text-[var(--text-primary)]">
+                    {dict.tracker.activeTitle}: {sess.appName}
+                  </span>
+                </div>
+                <span className="num-tabular text-[11.5px] text-[var(--text-secondary)]">
+                  {baselineText}
                 </span>
               </div>
-              <span className="num-tabular text-[11.5px] text-[var(--text-secondary)]">
-                Baseline: {sess.baselineDirCount} dirs / {sess.baselineRegCount} reg entries
-              </span>
+
+              {sess.installerExited ? (
+                <div className="flex items-center gap-2 rounded-[10px] border border-[var(--success-border)] bg-[var(--bg-surface)] px-3 py-2 text-[12px] font-medium text-[var(--success-text)]">
+                  <CheckCircle2 className="h-4 w-4 shrink-0" strokeWidth={1.5} />
+                  <span>{dict.tracker.installerExitedBanner}</span>
+                </div>
+              ) : (
+                <p className="text-[12.5px] text-[var(--text-secondary)]">
+                  {dict.tracker.activeHint}
+                </p>
+              )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={finishingId === sess.sessionId}
+                  onClick={() => handleFinish(sess.sessionId)}
+                  className="ui-btn-primary h-8"
+                >
+                  {finishingId === sess.sessionId ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
+                  ) : (
+                    <Square className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  )}
+                  {dict.tracker.finishTracking}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCancel(sess.sessionId)}
+                  className="ui-btn-ghost h-8"
+                >
+                  <X className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  {dict.tracker.cancelTracking}
+                </button>
+              </div>
             </div>
-            <p className="text-[12.5px] text-[var(--text-secondary)]">{dict.tracker.activeHint}</p>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={finishingId === sess.sessionId}
-                onClick={() => handleFinish(sess.sessionId)}
-                className="ui-btn-primary h-8"
-              >
-                {finishingId === sess.sessionId ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.5} />
-                ) : (
-                  <Square className="h-3.5 w-3.5" strokeWidth={1.5} />
-                )}
-                {dict.tracker.finishTracking}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleCancel(sess.sessionId)}
-                className="ui-btn-ghost h-8"
-              >
-                <X className="h-3.5 w-3.5" strokeWidth={1.5} />
-                {dict.tracker.cancelTracking}
-              </button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
 
         {/* Start New Tracking Card */}
         <section className="ui-card space-y-4 p-5">
@@ -230,6 +329,45 @@ export function InstallTrackerView({
                 {dict.tracker.browseInstaller}
               </button>
             </div>
+          </div>
+
+          {/* Extra watched roots */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11.5px] font-medium text-[var(--text-tertiary)]">
+                {dict.tracker.extraRootsLabel}
+              </span>
+              <button
+                type="button"
+                onClick={handleAddExtraRoot}
+                className="ui-btn-ghost h-6.5 px-2 text-[11.5px]"
+              >
+                <FolderPlus
+                  className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                  strokeWidth={1.5}
+                />
+                <span>{dict.tracker.addExtraRoot}</span>
+              </button>
+            </div>
+            {extraRoots.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {extraRoots.map((root) => (
+                  <span
+                    key={root}
+                    className="inline-flex items-center gap-1.5 rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-2.5 py-1 font-mono text-[11px] text-[var(--text-secondary)]"
+                  >
+                    <span>{root}</span>
+                    <button
+                      type="button"
+                      onClick={() => setExtraRoots((prev) => prev.filter((r) => r !== root))}
+                      className="text-[var(--text-tertiary)] hover:text-[var(--text-primary)] cursor-pointer"
+                    >
+                      <X className="h-3 w-3" strokeWidth={1.5} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-3 pt-0.5">
@@ -281,6 +419,9 @@ export function InstallTrackerView({
                 const expanded = expandedTraceId === trace.id;
                 const regCount =
                   trace.addedRegistryKeys.length + trace.addedRegistryValues.length;
+                const svcCount = trace.addedServices?.length ?? 0;
+                const taskCount = trace.addedScheduledTasks?.length ?? 0;
+
                 return (
                   <div key={trace.id} className="ui-card overflow-hidden">
                     <div className="group flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
@@ -320,6 +461,16 @@ export function InstallTrackerView({
                           <span>
                             {regCount} {dict.tracker.regItems}
                           </span>
+                          {svcCount > 0 && (
+                            <span>
+                              {svcCount} {dict.tracker.services}
+                            </span>
+                          )}
+                          {taskCount > 0 && (
+                            <span>
+                              {taskCount} {dict.tracker.tasks}
+                            </span>
+                          )}
                           {trace.totalSizeBytes > 0 && (
                             <span className="font-medium text-[var(--text-primary)]">
                               {formatBytes(trace.totalSizeBytes)}
@@ -339,7 +490,19 @@ export function InstallTrackerView({
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDeleteTrace(trace.id)}
+                          onClick={() => handleExportTrace(trace)}
+                          title={dict.tracker.exportTrace}
+                          aria-label={dict.tracker.exportTrace}
+                          className="ui-btn-ghost h-8 w-8 p-0"
+                        >
+                          <Download
+                            className="h-3.5 w-3.5 text-[var(--text-tertiary)]"
+                            strokeWidth={1.5}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPendingDeleteTrace(trace)}
                           title={dict.tracker.deleteTrace}
                           aria-label={dict.tracker.deleteTrace}
                           className="ui-btn-ghost h-8 w-8 p-0"
@@ -391,6 +554,30 @@ export function InstallTrackerView({
                             [REG] {rv.keyPath} -&gt; {rv.valueName}
                           </div>
                         ))}
+                        {(trace.addedServices ?? []).map((svc) => (
+                          <div
+                            key={svc}
+                            className="flex items-center gap-1.5 text-[var(--text-primary)]"
+                          >
+                            <Wrench
+                              className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)]"
+                              strokeWidth={1.5}
+                            />
+                            <span className="truncate">[SVC] {svc}</span>
+                          </div>
+                        ))}
+                        {(trace.addedScheduledTasks ?? []).map((task) => (
+                          <div
+                            key={task}
+                            className="flex items-center gap-1.5 text-[var(--text-primary)]"
+                          >
+                            <Wrench
+                              className="h-3.5 w-3.5 shrink-0 text-[var(--text-tertiary)]"
+                              strokeWidth={1.5}
+                            />
+                            <span className="truncate">[TASK] {task}</span>
+                          </div>
+                        ))}
                       </div>
                     )}
                   </div>
@@ -400,6 +587,19 @@ export function InstallTrackerView({
           )}
         </section>
       </div>
+
+      {pendingDeleteTrace && (
+        <ConfirmDialog
+          title={dict.tracker.deleteTraceConfirmTitle}
+          description={dict.tracker.deleteTraceConfirm}
+          detail={pendingDeleteTrace.appName}
+          confirmLabel={dict.common.delete}
+          cancelLabel={dict.common.cancel}
+          danger
+          onCancel={() => setPendingDeleteTrace(null)}
+          onConfirm={() => void confirmDeleteTrace()}
+        />
+      )}
     </div>
   );
 }

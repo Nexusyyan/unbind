@@ -1,4 +1,4 @@
-use crate::models::{AppKind, Arch, InstallScope, InstalledApp};
+use crate::models::{AppKind, Arch, InstallScope, InstalledApp, PackageManagerKind};
 use crate::safety::is_protected_path;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -166,6 +166,7 @@ fn scan_single_view(target: &ScanTarget) -> Vec<InstalledApp> {
 
         let has_uninstaller = !uninstall_string.trim().is_empty() || !quiet_uninstall_string.trim().is_empty();
         let is_valid_entry = check_entry_validity(&uninstall_string, &install_location, kind);
+        let package_manager = detect_package_manager(&install_location, &uninstall_string, &full_reg_key);
 
         let id = format!(
             "win32:{}:{}:{}",
@@ -200,6 +201,8 @@ fn scan_single_view(target: &ScanTarget) -> Vec<InstalledApp> {
             is_valid_entry,
             has_uninstaller,
             tracked_trace_id: None,
+            package_manager,
+            size_measured: false,
         });
     }
 
@@ -462,9 +465,57 @@ fn check_entry_validity(uninstall_string: &str, install_location: &str, kind: Ap
     false
 }
 
+pub fn detect_package_manager(
+    install_location: &str,
+    uninstall_string: &str,
+    registry_key: &str,
+) -> PackageManagerKind {
+    let hay = format!(
+        "{}|{}|{}",
+        install_location.replace('/', "\\").to_lowercase(),
+        uninstall_string.replace('/', "\\").to_lowercase(),
+        registry_key.replace('/', "\\").to_lowercase()
+    );
+    if hay.contains("\\scoop\\apps\\") {
+        PackageManagerKind::Scoop
+    } else if hay.contains("\\chocolatey\\lib\\") || hay.contains("choco.exe") {
+        PackageManagerKind::Chocolatey
+    } else if hay.contains("\\microsoft\\winget\\packages\\")
+        || hay.contains("\\winget\\links\\")
+    {
+        PackageManagerKind::Winget
+    } else {
+        PackageManagerKind::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detect_package_manager() {
+        assert_eq!(
+            detect_package_manager("C:\\Users\\Me\\scoop\\apps\\ripgrep\\current", "", ""),
+            PackageManagerKind::Scoop
+        );
+        assert_eq!(
+            detect_package_manager("C:\\ProgramData\\chocolatey\\lib\\git\\tools", "", ""),
+            PackageManagerKind::Chocolatey
+        );
+        assert_eq!(
+            detect_package_manager(
+                "C:\\Users\\Me\\AppData\\Local\\Microsoft\\WinGet\\Packages\\demo",
+                "",
+                ""
+            ),
+            PackageManagerKind::Winget
+        );
+        assert_eq!(
+            detect_package_manager("C:\\Program Files\\7-Zip", "", ""),
+            PackageManagerKind::None
+        );
+    }
 
     #[test]
     fn test_extract_guid_and_quiet_synthesis() {

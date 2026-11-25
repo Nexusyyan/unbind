@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertCircle, CheckCircle2, Clock, Loader2, Play, Trash2, X, Zap } from "lucide-react";
 import { api } from "../api/client";
 import type { Dict } from "../i18n";
@@ -34,6 +34,17 @@ export function BatchUninstallModal({
     apps.map((app) => ({ app, status: "pending" })),
   );
   const [combinedLeftovers, setCombinedLeftovers] = useState<LeftoverItem[]>([]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !running) {
+        e.preventDefault();
+        onClose(finished);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [running, finished, onClose]);
 
   const handleStart = async () => {
     setRunning(true);

@@ -2,7 +2,7 @@ use crate::discovery::appx::remove_appx_package;
 use crate::models::{
     CleanupOptions, CoreError, CoreResult, InstalledApp, LeftoverItem, StartupItem,
 };
-use crate::safety::create_system_restore_point;
+use crate::safety::{create_system_restore_point, restore_registry_backup};
 use crate::startup::{delete_startup_item, set_startup_enabled};
 use crate::uninstaller::{execute_cleanup, run_native_uninstaller};
 use crate::unlocker::{find_locking_processes, terminate_processes};
@@ -46,6 +46,9 @@ pub enum WorkerRequest {
     },
     RemoveAppxPackage {
         package_full_name: String,
+    },
+    RestoreRegistryBackup {
+        path: String,
     },
 }
 
@@ -121,6 +124,10 @@ pub fn dispatch_worker_request(req: WorkerRequest) -> WorkerResponse {
         WorkerRequest::RemoveAppxPackage { package_full_name } => {
             remove_appx_package(&package_full_name)?;
             Ok(serde_json::json!({ "removed": true }))
+        }
+        WorkerRequest::RestoreRegistryBackup { path } => {
+            restore_registry_backup(Path::new(&path))?;
+            Ok(serde_json::json!({ "restored": true }))
         }
     })();
 

@@ -1,6 +1,7 @@
 export type AppKind = "win32" | "msi" | "storeApp";
 export type InstallScope = "machine" | "user";
 export type Arch = "x64" | "x86" | "arm64" | "neutral";
+export type PackageManagerKind = "none" | "winget" | "scoop" | "chocolatey";
 
 export interface InstalledApp {
   id: string;
@@ -28,6 +29,8 @@ export interface InstalledApp {
   isValidEntry: boolean;
   hasUninstaller: boolean;
   trackedTraceId: string | null;
+  packageManager?: PackageManagerKind;
+  sizeMeasured?: boolean;
 }
 
 export type LeftoverKind =
@@ -49,6 +52,8 @@ export interface LeftoverItem {
   sizeBytes: number;
   confidence: ConfidenceLevel;
   reason: string;
+  reasonCode?: string;
+  reasonParam?: string | null;
   selectedByDefault: boolean;
   requiresElevation: boolean;
 }
@@ -94,6 +99,12 @@ export interface LockingProcessInfo {
   restartable: boolean;
 }
 
+export interface RunningProcessInfo {
+  pid: number;
+  name: string;
+  exePath: string;
+}
+
 export type StartupSource =
   | "registryCurrentUserRun"
   | "registryCurrentUserRunOnce"
@@ -131,6 +142,9 @@ export interface InstallTrace {
   addedFiles: string[];
   addedRegistryKeys: string[];
   addedRegistryValues: TrackedRegValue[];
+  addedServices?: string[];
+  addedScheduledTasks?: string[];
+  watchedRoots?: string[];
   totalSizeBytes: number;
 }
 
@@ -142,6 +156,9 @@ export interface ActiveTrackSession {
   baselineDirCount: number;
   baselineFileCount: number;
   baselineRegCount: number;
+  watchedRoots?: string[];
+  installerPid?: number | null;
+  installerExited?: boolean;
 }
 
 export interface BackupEntry {
@@ -161,6 +178,14 @@ export interface OperationLogEntry {
   success: boolean;
 }
 
+export interface WindowBounds {
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  maximized: boolean;
+}
+
 export interface AppSettings {
   portableMode: boolean;
   dataDir: string;
@@ -171,6 +196,8 @@ export interface AppSettings {
   showWindowsUpdates: boolean;
   language: string;
   theme: string;
+  customTrackRoots?: string[];
+  windowBounds?: WindowBounds | null;
 }
 
 export interface SystemStatus {
@@ -180,6 +207,31 @@ export interface SystemStatus {
   dataDir: string;
   windowsVersion: string;
   appVersion: string;
+}
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+  releaseUrl: string;
+  publishedAt: string;
+  notesPreview: string;
+}
+
+export interface ShellIntegrationStatus {
+  forceRemoveEnabled: boolean;
+  trackInstallEnabled: boolean;
+  registeredExe: string;
+}
+
+export interface CliAction {
+  action: "forceRemove" | "trackInstall";
+  path: string;
+}
+
+export interface InstallerExitedPayload {
+  sessionId: string;
+  exitCode: number | null;
 }
 
 export type ExportFormat = "html" | "csv" | "json";
@@ -200,6 +252,13 @@ export type AppFilterMode =
   | "system";
 
 export type AppSortField = "name" | "size" | "date" | "publisher";
+
+export interface AppListViewState {
+  query: string;
+  filterMode: AppFilterMode;
+  sortField: AppSortField;
+  sortDesc: boolean;
+}
 
 export interface ToastMessage {
   id: string;

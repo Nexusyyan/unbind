@@ -348,53 +348,94 @@ pub fn delete_startup_item(item: &StartupItem) -> CoreResult<()> {
     }
 }
 
-/// Read third-party scheduled tasks directly from the Windows Tasks registry tree (much faster and
-/// locale-independent compared to parsing `schtasks /V` text!).
-fn scan_scheduled_tasks() -> Vec<StartupItem> {
+#[derive(Debug, Clone)]
+pub struct ScheduledTaskInfo {
+    pub name: String,
+    pub task_path: String,
+    pub command: String,
+    pub executable_path: String,
+    pub enabled: bool,
+}
+
+/// Enumerate third-party Windows Scheduled Tasks (skipping built-in Microsoft OS folders)
+/// up to depth 3 directly from the Windows TaskCache registry tree + System32\Tasks XML.
+pub fn enumerate_third_party_scheduled_tasks() -> Vec<ScheduledTaskInfo> {
     let mut results = Vec::new();
     let root = RegKey::predef(HKEY_LOCAL_MACHINE);
     let tree_base = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree";
     let Ok(tree_key) = root.open_subkey_with_flags(tree_base, KEY_READ) else {
         return results;
     };
+    walk_task_tree(&tree_key, "", 0, &mut results);
+    results
+}
 
-    // Inspect top-level third-party tasks only (skip Microsoft built-in OS tasks).
-    for task_name in tree_key.enum_keys().flatten() {
-        if task_name.eq_ignore_ascii_case("Microsoft")
-            || task_name.eq_ignore_ascii_case("MicrosoftEdgeUpdateTaskMachineCore")
+fn walk_task_tree(key: &RegKey, rel_prefix: &str, depth: usize, out: &mut Vec<ScheduledTaskInfo>) {
+    if depth > 2 {
+        return;
+    }
+    for sub_name in key.enum_keys().flatten() {
+        if depth == 0
+            && (sub_name.eq_ignore_ascii_case("Microsoft")
+                || sub_name.eq_ignore_ascii_case("MicrosoftEdgeUpdateTaskMachineCore"))
         {
             continue;
         }
-        if let Ok(sub) = tree_key.open_subkey_with_flags(&task_name, KEY_READ) {
-            // Only treat leaf task entries (those containing an `Id` GUID value) as tasks.
-            let task_id: String = sub.get_value("Id").unwrap_or_default();
-            if task_id.is_empty() {
-                continue;
-            }
-            let task_path = format!("\\{}", task_name);
-            let (command, enabled) = inspect_task_xml(&task_name);
+        let Ok(sub) = key.open_subkey_with_flags(&sub_name, KEY_READ) else {
+            continue;
+        };
+        let rel_path = if rel_prefix.is_empty() {
+            sub_name.clone()
+        } else {
+            format!("{}\\{}", rel_prefix, sub_name)
+        };
+        let task_id: String = sub.get_value("Id").unwrap_or_default();
+        if !task_id.is_empty() {
+            let task_path = format!("\\{}", rel_path);
+            let (command, enabled) = inspect_task_xml(&rel_path);
             let exe = extract_executable_from_command(&command);
-            let exe_str = exe
+            let executable_path = exe
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let valid = exe.as_ref().map(|p| p.exists()).unwrap_or(true);
-
-            results.push(StartupItem {
-                id: format!("startup:task:{}", task_path),
-                name: task_name,
+            out.push(ScheduledTaskInfo {
+                name: sub_name,
+                task_path,
                 command,
-                executable_path: exe_str,
-                publisher: String::new(),
-                source: StartupSource::ScheduledTask,
-                location: task_path,
+                executable_path,
                 enabled,
-                is_valid_target: valid,
-                requires_elevation: true,
             });
+        } else {
+            walk_task_tree(&sub, &rel_path, depth + 1, out);
         }
     }
-    results
+}
+
+/// Read third-party scheduled tasks directly from the Windows Tasks registry tree (much faster and
+/// locale-independent compared to parsing `schtasks /V` text!).
+fn scan_scheduled_tasks() -> Vec<StartupItem> {
+    enumerate_third_party_scheduled_tasks()
+        .into_iter()
+        .map(|info| {
+            let valid = if info.executable_path.is_empty() {
+                true
+            } else {
+                Path::new(&info.executable_path).exists()
+            };
+            StartupItem {
+                id: format!("startup:task:{}", info.task_path),
+                name: info.name,
+                command: info.command,
+                executable_path: info.executable_path,
+                publisher: String::new(),
+                source: StartupSource::ScheduledTask,
+                location: info.task_path,
+                enabled: info.enabled,
+                is_valid_target: valid,
+                requires_elevation: true,
+            }
+        })
+        .collect()
 }
 
 fn inspect_task_xml(task_name: &str) -> (String, bool) {

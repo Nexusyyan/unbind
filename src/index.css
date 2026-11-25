@@ -422,6 +422,17 @@
     border-width: 0 1.6px 1.6px 0;
     transform: rotate(45deg);
   }
+  .ui-checkbox:indeterminate {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+  }
+  .ui-checkbox:indeterminate::after {
+    content: "";
+    width: 7px;
+    height: 1.6px;
+    border-radius: 1px;
+    background: var(--accent-primary-fg);
+  }
   .ui-checkbox:disabled {
     opacity: 0.42;
     cursor: not-allowed;

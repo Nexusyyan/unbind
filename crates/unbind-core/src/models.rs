@@ -47,6 +47,16 @@ pub enum Arch {
     Neutral,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PackageManagerKind {
+    #[default]
+    None,
+    Winget,
+    Scoop,
+    Chocolatey,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledApp {
@@ -56,7 +66,7 @@ pub struct InstalledApp {
     pub version: String,
     /// Normalized YYYY-MM-DD when parseable, otherwise raw or empty.
     pub install_date: String,
-    /// Estimated size in kilobytes (0 if unknown).
+    /// Estimated or measured size in kilobytes (0 if unknown).
     pub estimated_size_kb: u64,
     pub install_location: String,
     pub uninstall_string: String,
@@ -77,6 +87,10 @@ pub struct InstalledApp {
     pub is_valid_entry: bool,
     pub has_uninstaller: bool,
     pub tracked_trace_id: Option<String>,
+    #[serde(default)]
+    pub package_manager: PackageManagerKind,
+    #[serde(default)]
+    pub size_measured: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +125,10 @@ pub struct LeftoverItem {
     pub size_bytes: u64,
     pub confidence: ConfidenceLevel,
     pub reason: String,
+    #[serde(default)]
+    pub reason_code: String,
+    #[serde(default)]
+    pub reason_param: Option<String>,
     pub selected_by_default: bool,
     pub requires_elevation: bool,
 }
@@ -178,6 +196,14 @@ pub struct LockingProcessInfo {
     pub restartable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub exe_path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StartupSource {
@@ -217,6 +243,12 @@ pub struct InstallTrace {
     pub added_files: Vec<String>,
     pub added_registry_keys: Vec<String>,
     pub added_registry_values: Vec<TrackedRegValue>,
+    #[serde(default)]
+    pub added_services: Vec<String>,
+    #[serde(default)]
+    pub added_scheduled_tasks: Vec<String>,
+    #[serde(default)]
+    pub watched_roots: Vec<String>,
     pub total_size_bytes: u64,
 }
 
@@ -237,6 +269,12 @@ pub struct ActiveTrackSession {
     pub baseline_dir_count: usize,
     pub baseline_file_count: usize,
     pub baseline_reg_count: usize,
+    #[serde(default)]
+    pub watched_roots: Vec<String>,
+    #[serde(default)]
+    pub installer_pid: Option<u32>,
+    #[serde(default)]
+    pub installer_exited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +300,16 @@ pub struct OperationLogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WindowBounds {
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    pub maximized: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub portable_mode: bool,
     pub data_dir: String,
@@ -272,6 +320,10 @@ pub struct AppSettings {
     pub show_windows_updates: bool,
     pub language: String,
     pub theme: String,
+    #[serde(default)]
+    pub custom_track_roots: Vec<String>,
+    #[serde(default)]
+    pub window_bounds: Option<WindowBounds>,
 }
 
 impl Default for AppSettings {
@@ -286,6 +338,8 @@ impl Default for AppSettings {
             show_windows_updates: false,
             language: "auto".to_string(),
             theme: "system".to_string(),
+            custom_track_roots: Vec::new(),
+            window_bounds: None,
         }
     }
 }
@@ -299,6 +353,25 @@ pub struct SystemStatus {
     pub data_dir: String,
     pub windows_version: String,
     pub app_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub release_url: String,
+    pub published_at: String,
+    pub notes_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellIntegrationStatus {
+    pub force_remove_enabled: bool,
+    pub track_install_enabled: bool,
+    pub registered_exe: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

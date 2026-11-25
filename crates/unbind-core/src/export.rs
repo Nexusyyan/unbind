@@ -126,7 +126,7 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AppKind, Arch, InstallScope};
+    use crate::models::{AppKind, Arch, InstallScope, PackageManagerKind};
     use tempfile::tempdir;
 
     #[test]
@@ -158,6 +158,8 @@ mod tests {
             is_valid_entry: true,
             has_uninstaller: true,
             tracked_trace_id: None,
+            package_manager: PackageManagerKind::None,
+            size_measured: false,
         }];
 
         for (fmt, name) in [

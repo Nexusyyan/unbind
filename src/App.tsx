@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api, isTauriRuntime } from "./api/client";
 import { AppListView } from "./components/AppListView";
 import { BackupsView } from "./components/BackupsView";
 import { BatchUninstallModal } from "./components/BatchUninstallModal";
+import { DropActionModal } from "./components/DropActionModal";
 import { ForceUninstallModal } from "./components/ForceUninstallModal";
 import { InstallTrackerView } from "./components/InstallTrackerView";
 import { SettingsView } from "./components/SettingsView";
@@ -15,11 +17,14 @@ import { UninstallWizardModal } from "./components/UninstallWizardModal";
 import { getDict, resolveLocale } from "./i18n";
 import type {
   ActiveTrackSession,
+  AppListViewState,
   AppSettings,
   BackupEntry,
+  CliAction,
   ExportFormat,
   InstallTrace,
   InstalledApp,
+  InstallerExitedPayload,
   LeftoverItem,
   NavTab,
   OperationLogEntry,
@@ -38,15 +43,32 @@ const DEFAULT_SETTINGS: AppSettings = {
   showWindowsUpdates: false,
   language: "auto",
   theme: "system",
+  customTrackRoots: [],
 };
+
+const DEFAULT_LIST_STATE: AppListViewState = {
+  query: "",
+  filterMode: "all",
+  sortField: "name",
+  sortDesc: false,
+};
+
+function isInstallerFilePath(path: string): boolean {
+  return /\.(exe|msi|msix)$/i.test(path.trim());
+}
 
 export function App() {
   const [activeTab, setActiveTab] = useState<NavTab>("apps");
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
 
+  // Lifted filter/sort/search states per list tab so switching tabs never loses context.
+  const [appsViewState, setAppsViewState] = useState<AppListViewState>(DEFAULT_LIST_STATE);
+  const [storeViewState, setStoreViewState] = useState<AppListViewState>(DEFAULT_LIST_STATE);
+
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [appsLoading, setAppsLoading] = useState(true);
+  const [resolvingSizes, setResolvingSizes] = useState(false);
   const [icons, setIcons] = useState<Record<string, string>>({});
   const pendingIconIdsRef = useRef<Set<string>>(new Set());
 
@@ -55,11 +77,14 @@ export function App() {
 
   const [activeTracks, setActiveTracks] = useState<ActiveTrackSession[]>([]);
   const [traces, setTraces] = useState<InstallTrace[]>([]);
+  const [prefillTrackerPath, setPrefillTrackerPath] = useState<string | null>(null);
+
   const [backups, setBackups] = useState<BackupEntry[]>([]);
   const [logs, setLogs] = useState<OperationLogEntry[]>([]);
 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [dragHover, setDragHover] = useState(false);
+  const [droppedInstallerPath, setDroppedInstallerPath] = useState<string | null>(null);
 
   // Modal states
   const [wizardState, setWizardState] = useState<{
@@ -80,6 +105,8 @@ export function App() {
 
   const locale = useMemo(() => resolveLocale(settings.language), [settings.language]);
   const dict = useMemo(() => getDict(locale), [locale]);
+  const dictRef = useRef(dict);
+  dictRef.current = dict;
 
   const notify = useCallback(
     (kind: ToastMessage["kind"], title: string, detail?: string) => {
@@ -106,6 +133,15 @@ export function App() {
     return () => mq.removeEventListener("change", apply);
   }, [settings.theme]);
 
+  const handleCliAction = useCallback((action: CliAction) => {
+    if (action.action === "forceRemove") {
+      setForceModalState({ initialPath: action.path });
+    } else if (action.action === "trackInstall") {
+      setPrefillTrackerPath(action.path);
+      setActiveTab("tracker");
+    }
+  }, []);
+
   const refreshStatus = useCallback(async () => {
     try {
       const s = await api.getSystemStatus();
@@ -120,8 +156,19 @@ export function App() {
     try {
       const list = await api.listApps();
       setApps(list);
+      const needsMeasure = list.some(
+        (a) =>
+          a.estimatedSizeKb === 0 &&
+          (Boolean(a.installLocation) || (a.kind === "storeApp" && Boolean(a.packageFamilyName))),
+      );
+      if (needsMeasure && isTauriRuntime()) {
+        setResolvingSizes(true);
+        void api.resolveAppSizes().catch(() => setResolvingSizes(false));
+      } else {
+        setResolvingSizes(false);
+      }
     } catch (err) {
-      notify("error", "Failed to load applications", String(err));
+      notify("error", dictRef.current.common.loadAppsFailed, String(err));
     } finally {
       setAppsLoading(false);
     }
@@ -133,7 +180,7 @@ export function App() {
       const list = await api.listStartupItems();
       setStartupItems(list);
     } catch (err) {
-      notify("error", "Failed to load startup items", String(err));
+      notify("error", dictRef.current.common.loadStartupFailed, String(err));
     } finally {
       setStartupLoading(false);
     }
@@ -165,20 +212,74 @@ export function App() {
     }
   }, []);
 
-  // Initial load
+  // Initial load + pending CLI action check
   useEffect(() => {
     void (async () => {
-      const [st, cfg] = await Promise.all([api.getSystemStatus(), api.getSettings()]);
+      const [st, cfg, pendingAction] = await Promise.all([
+        api.getSystemStatus(),
+        api.getSettings(),
+        api.takePendingCliAction(),
+      ]);
       setStatus(st);
       setSettings(cfg);
+      if (pendingAction) {
+        handleCliAction(pendingAction);
+      }
       void refreshApps();
       void refreshStartup();
       void refreshTracker();
       void refreshBackupsAndLogs();
     })();
-  }, [refreshApps, refreshStartup, refreshTracker, refreshBackupsAndLogs]);
+  }, [refreshApps, refreshStartup, refreshTracker, refreshBackupsAndLogs, handleCliAction]);
 
-  // Listen for native OS drag-and-drop (unblocked because UI runs non-elevated!)
+  // Listen to backend streaming events (async real sizes, installer exit, single-instance CLI)
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    const unsubs: Array<() => void> = [];
+
+    void listen<Record<string, number>>("apps://size-batch", (event) => {
+      const batch = event.payload;
+      if (!batch || Object.keys(batch).length === 0) return;
+      setApps((prev) =>
+        prev.map((app) => {
+          const kb = batch[app.id];
+          if (kb !== undefined && kb > 0) {
+            return { ...app, estimatedSizeKb: kb, sizeMeasured: true };
+          }
+          return app;
+        }),
+      );
+    }).then((u) => unsubs.push(u));
+
+    void listen<boolean>("apps://size-done", () => {
+      setResolvingSizes(false);
+    }).then((u) => unsubs.push(u));
+
+    void listen<InstallerExitedPayload>("tracker://installer-exited", (event) => {
+      const { sessionId } = event.payload;
+      setActiveTracks((prev) => {
+        const hit = prev.find((s) => s.sessionId === sessionId);
+        if (hit) {
+          notify("success", dictRef.current.tracker.installerExitedToast, hit.appName);
+        }
+        return prev.map((s) =>
+          s.sessionId === sessionId ? { ...s, installerExited: true } : s,
+        );
+      });
+    }).then((u) => unsubs.push(u));
+
+    void listen<CliAction>("cli://action", (event) => {
+      if (event.payload) {
+        handleCliAction(event.payload);
+      }
+    }).then((u) => unsubs.push(u));
+
+    return () => {
+      unsubs.forEach((fn) => fn());
+    };
+  }, [notify, handleCliAction]);
+
+  // Listen for native OS drag-and-drop (smart routing for installers vs folders/shortcuts)
   useEffect(() => {
     if (!isTauriRuntime()) return;
     let unlisten: (() => void) | undefined;
@@ -192,7 +293,11 @@ export function App() {
           setDragHover(false);
           const dropped = event.payload.paths?.[0];
           if (dropped) {
-            setForceModalState({ initialPath: dropped });
+            if (isInstallerFilePath(dropped)) {
+              setDroppedInstallerPath(dropped);
+            } else {
+              setForceModalState({ initialPath: dropped });
+            }
           }
         }
       })
@@ -227,17 +332,19 @@ export function App() {
   }, []);
 
   const handleSaveSettings = useCallback(
-    async (next: AppSettings) => {
+    async (next: AppSettings, silent = false) => {
       try {
         const saved = await api.saveSettings(next);
         setSettings(saved);
         await refreshStatus();
-        notify("success", dict.settings.saved);
+        if (!silent) {
+          notify("success", dictRef.current.settings.saved);
+        }
       } catch (err) {
-        notify("error", dict.settings.title, String(err));
+        notify("error", dictRef.current.settings.title, String(err));
       }
     },
-    [dict.settings.saved, dict.settings.title, notify, refreshStatus],
+    [notify, refreshStatus],
   );
 
   const handleElevate = useCallback(async () => {
@@ -245,21 +352,21 @@ export function App() {
     try {
       await api.elevateSession();
       await refreshStatus();
-      notify("success", dict.status.elevated, "Elevated helper session active");
+      notify("success", dictRef.current.status.elevated, dictRef.current.status.elevatedDetail);
     } catch (err) {
-      notify("warning", dict.status.standard, String(err));
+      notify("warning", dictRef.current.status.standard, String(err));
     }
-  }, [status, refreshStatus, notify, dict.status.elevated, dict.status.standard]);
+  }, [status, refreshStatus, notify]);
 
   const handleToggleLocale = useCallback(() => {
     const nextLang = locale === "zh-CN" ? "en" : "zh-CN";
-    void handleSaveSettings({ ...settings, language: nextLang });
+    void handleSaveSettings({ ...settings, language: nextLang }, true);
   }, [locale, settings, handleSaveSettings]);
 
   const handleCycleTheme = useCallback(() => {
     const order = ["system", "dark", "light"];
     const next = order[(order.indexOf(settings.theme) + 1) % order.length];
-    void handleSaveSettings({ ...settings, theme: next });
+    void handleSaveSettings({ ...settings, theme: next }, true);
   }, [settings, handleSaveSettings]);
 
   const handleExport = useCallback(
@@ -271,12 +378,16 @@ export function App() {
       if (!savePath) return;
       try {
         const count = await api.exportApps(format, savePath, visibleApps);
-        notify("success", dict.toolbar.export, `Exported ${count} apps to ${savePath}`);
+        notify(
+          "success",
+          dictRef.current.toolbar.export,
+          `${dictRef.current.common.exportedPrefix} ${count} ${dictRef.current.common.itemsTo} ${savePath}`,
+        );
       } catch (err) {
-        notify("error", dict.toolbar.export, String(err));
+        notify("error", dictRef.current.toolbar.export, String(err));
       }
     },
-    [dict.toolbar.export, notify],
+    [notify],
   );
 
   const handleCheckLocksForApp = useCallback(
@@ -285,7 +396,7 @@ export function App() {
       try {
         const locks = await api.checkFileLocks([app.installLocation]);
         if (locks.length === 0) {
-          notify("success", app.name, dict.force.noLocks);
+          notify("success", app.name, dictRef.current.force.noLocks);
         } else {
           setForceModalState({ initialPath: app.installLocation });
         }
@@ -293,7 +404,49 @@ export function App() {
         notify("error", app.name, String(err));
       }
     },
-    [dict.force.noLocks, notify],
+    [notify],
+  );
+
+  const handleCleanBrokenEntries = useCallback(
+    async (brokenApps: InstalledApp[]) => {
+      const items: LeftoverItem[] = brokenApps
+        .filter((a) => Boolean(a.registryKey))
+        .map((a) => ({
+          id: `broken-${a.id}`,
+          kind: "registryKey",
+          path: a.registryKey,
+          valueName: null,
+          sizeBytes: 0,
+          confidence: "high",
+          reason: "Invalid Uninstall registry entry",
+          reasonCode: "broken_entry",
+          reasonParam: null,
+          selectedByDefault: true,
+          requiresElevation: a.registryHive.toUpperCase() === "HKLM",
+        }));
+      if (items.length === 0) return;
+
+      try {
+        const report = await api.cleanLeftovers("InvalidEntries", items, {
+          useRecycleBin: settings.useRecycleBin,
+          backupRegistry: settings.autoBackupRegistry,
+          createRestorePoint: false,
+          scheduleRebootOnLock: false,
+          terminateLockingProcesses: false,
+        });
+        notify(
+          report.failed === 0 ? "success" : "warning",
+          dictRef.current.toolbar.cleanAllBrokenTitle,
+          `${dictRef.current.wizard.succeeded}: ${report.succeeded}, ${dictRef.current.wizard.failed}: ${report.failed}`,
+        );
+        void refreshApps();
+        void refreshBackupsAndLogs();
+        void refreshStatus();
+      } catch (err) {
+        notify("error", dictRef.current.toolbar.cleanAllBrokenTitle, String(err));
+      }
+    },
+    [settings, notify, refreshApps, refreshBackupsAndLogs, refreshStatus],
   );
 
   const counts = useMemo(() => {
@@ -337,6 +490,7 @@ export function App() {
           onSelectTab={setActiveTab}
           counts={counts}
           totalSizeKb={counts.totalSizeKb}
+          resolvingSizes={resolvingSizes}
         />
 
         <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-tl-[12px] border-t border-l border-[var(--border-hairline)] bg-[var(--bg-canvas)]">
@@ -347,6 +501,8 @@ export function App() {
               loading={appsLoading}
               storeOnly={activeTab === "store"}
               settings={settings}
+              viewState={activeTab === "store" ? storeViewState : appsViewState}
+              onChangeViewState={activeTab === "store" ? setStoreViewState : setAppsViewState}
               icons={icons}
               onRequestIcons={requestIcons}
               onRefresh={refreshApps}
@@ -361,6 +517,7 @@ export function App() {
               onBatchUninstall={(selected, quiet) =>
                 setBatchModalState({ apps: selected, quiet })
               }
+              onCleanBrokenEntries={handleCleanBrokenEntries}
               onExport={handleExport}
               onCheckLocks={handleCheckLocksForApp}
               onNotify={notify}
@@ -382,6 +539,9 @@ export function App() {
               dict={dict}
               activeSessions={activeTracks}
               traces={traces}
+              defaultExtraRoots={settings.customTrackRoots ?? []}
+              prefillInstallerPath={prefillTrackerPath}
+              onConsumePrefill={() => setPrefillTrackerPath(null)}
               onRefresh={() => {
                 void refreshTracker();
                 void refreshApps();
@@ -411,9 +571,11 @@ export function App() {
           {activeTab === "settings" && (
             <SettingsView
               dict={dict}
+              locale={locale}
               settings={settings}
               status={status}
-              onSave={handleSaveSettings}
+              onSave={(next) => handleSaveSettings(next, true)}
+              onNotify={notify}
             />
           )}
         </main>
@@ -433,6 +595,26 @@ export function App() {
         </div>
       )}
 
+      {/* Smart Installer Drop Choice Modal */}
+      {droppedInstallerPath && (
+        <DropActionModal
+          dict={dict}
+          path={droppedInstallerPath}
+          onClose={() => setDroppedInstallerPath(null)}
+          onForceRemove={() => {
+            const p = droppedInstallerPath;
+            setDroppedInstallerPath(null);
+            setForceModalState({ initialPath: p });
+          }}
+          onTrackInstall={() => {
+            const p = droppedInstallerPath;
+            setDroppedInstallerPath(null);
+            setPrefillTrackerPath(p);
+            setActiveTab("tracker");
+          }}
+        />
+      )}
+
       {/* Uninstall / Leftover Wizard Modal */}
       {wizardState && (
         <UninstallWizardModal
@@ -443,6 +625,7 @@ export function App() {
           preloadedLeftovers={wizardState.preloadedLeftovers}
           settings={settings}
           onStatusRefresh={refreshStatus}
+          onNotify={notify}
           onClose={(didModify) => {
             setWizardState(null);
             if (didModify) {

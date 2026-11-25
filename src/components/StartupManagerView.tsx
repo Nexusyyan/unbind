@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FolderOpen,
   KeyRound,
@@ -11,6 +11,7 @@ import {
 import { api } from "../api/client";
 import type { Dict } from "../i18n";
 import type { StartupItem, StartupSource } from "../types";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface StartupManagerViewProps {
   dict: Dict;
@@ -22,22 +23,22 @@ interface StartupManagerViewProps {
 
 type StartupFilter = "all" | "enabled" | "disabled" | "invalid";
 
-function sourceLabel(source: StartupSource): string {
+function sourceLabel(source: StartupSource, dict: Dict): string {
   switch (source) {
     case "registryCurrentUserRun":
-      return "HKCU Run";
+      return dict.startup.sourceHkcuRun;
     case "registryCurrentUserRunOnce":
-      return "HKCU RunOnce";
+      return dict.startup.sourceHkcuRunOnce;
     case "registryLocalMachineRun":
-      return "HKLM Run (64)";
+      return dict.startup.sourceHklmRun64;
     case "registryLocalMachineWow64Run":
-      return "HKLM Run (32)";
+      return dict.startup.sourceHklmRun32;
     case "startupFolderUser":
-      return "User Startup";
+      return dict.startup.sourceFolderUser;
     case "startupFolderCommon":
-      return "Common Startup";
+      return dict.startup.sourceFolderCommon;
     case "scheduledTask":
-      return "Scheduled Task";
+      return dict.startup.sourceScheduledTask;
   }
 }
 
@@ -51,6 +52,23 @@ export function StartupManagerView({
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<StartupFilter>("all");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<StartupItem | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      } else if (e.key === "F5") {
+        e.preventDefault();
+        onRefresh();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onRefresh]);
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -59,12 +77,12 @@ export function StartupManagerView({
       if (filter === "disabled" && item.enabled) return false;
       if (filter === "invalid" && item.isValidTarget) return false;
       if (q) {
-        const hay = `${item.name} ${item.command} ${item.location} ${sourceLabel(item.source)}`.toLowerCase();
+        const hay = `${item.name} ${item.command} ${item.location} ${sourceLabel(item.source, dict)}`.toLowerCase();
         return hay.includes(q);
       }
       return true;
     });
-  }, [items, query, filter]);
+  }, [items, query, filter, dict]);
 
   const handleToggle = async (item: StartupItem) => {
     setBusyId(item.id);
@@ -83,14 +101,14 @@ export function StartupManagerView({
     }
   };
 
-  const handleDelete = async (item: StartupItem) => {
-    if (!window.confirm(`${dict.startup.deleteConfirm}\n\n${item.name}\n${item.location}`)) {
-      return;
-    }
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    const item = pendingDelete;
     setBusyId(item.id);
     try {
       await api.deleteStartupItem(item);
-      onNotify("success", item.name, "Removed from startup");
+      setPendingDelete(null);
+      onNotify("success", item.name, dict.startup.removedToast);
       onRefresh();
     } catch (err) {
       onNotify("error", item.name, String(err));
@@ -140,6 +158,7 @@ export function StartupManagerView({
               strokeWidth={1.5}
             />
             <input
+              ref={searchRef}
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -198,7 +217,7 @@ export function StartupManagerView({
           <div className="flex flex-col items-center justify-center py-16 text-[var(--text-tertiary)]">
             <Power className="h-8 w-8 opacity-50" strokeWidth={1.5} />
             <div className="mt-2.5 text-[13px] text-[var(--text-secondary)]">
-              No startup items match current filter
+              {dict.startup.emptyFilter}
             </div>
           </div>
         ) : (
@@ -229,7 +248,7 @@ export function StartupManagerView({
 
                   <div>
                     <span className="inline-flex rounded-[6px] bg-[var(--bg-subtle)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)]">
-                      {sourceLabel(item.source)}
+                      {sourceLabel(item.source, dict)}
                     </span>
                   </div>
 
@@ -273,8 +292,8 @@ export function StartupManagerView({
                             onNotify("error", item.name, String(e)),
                           )
                         }
-                        title={dict.appList.openFolder}
-                        aria-label={dict.appList.openFolder}
+                        title={dict.common.openDir}
+                        aria-label={dict.common.openDir}
                         className="ui-btn-ghost h-7 w-7 p-0"
                       >
                         <FolderOpen
@@ -304,9 +323,9 @@ export function StartupManagerView({
                     <button
                       type="button"
                       disabled={isBusy}
-                      onClick={() => handleDelete(item)}
-                      title="Delete"
-                      aria-label="Delete"
+                      onClick={() => setPendingDelete(item)}
+                      title={dict.common.delete}
+                      aria-label={dict.common.delete}
                       className="ui-btn-danger-ghost h-7 w-7 p-0"
                     >
                       <Trash2 className="h-3.5 w-3.5" strokeWidth={1.5} />
@@ -318,6 +337,20 @@ export function StartupManagerView({
           </div>
         )}
       </div>
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title={dict.startup.deleteConfirmTitle}
+          description={dict.startup.deleteConfirm}
+          detail={`${pendingDelete.name}\n${pendingDelete.location}`}
+          confirmLabel={dict.common.delete}
+          cancelLabel={dict.common.cancel}
+          danger
+          busy={busyId === pendingDelete.id}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => void confirmDelete()}
+        />
+      )}
     </div>
   );
 }
