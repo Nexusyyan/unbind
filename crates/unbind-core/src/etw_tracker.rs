@@ -499,7 +499,7 @@ impl EtwTrackerManager {
 
         if let Ok(mut guard) = self.sessions.lock() {
             if let Some(prev) = guard.insert(session_id.to_string(), running) {
-                stop_running_session(prev);
+                stop_running_session(prev, false);
             }
         }
 
@@ -560,7 +560,8 @@ impl EtwTrackerManager {
         };
 
         let state_arc = Arc::clone(&running.state);
-        stop_running_session(running);
+        // Drain final flushed kernel buffers completely before returning capture results.
+        stop_running_session(running, true);
 
         let result = state_arc
             .lock()
@@ -576,7 +577,7 @@ impl EtwTrackerManager {
             .ok()
             .and_then(|mut g| g.remove(session_id));
         if let Some(sess) = running {
-            stop_running_session(sess);
+            stop_running_session(sess, false);
             true
         } else {
             false
@@ -591,7 +592,7 @@ impl EtwTrackerManager {
             .map(|mut g| g.drain().map(|(_, v)| v).collect())
             .unwrap_or_default();
         for sess in drained {
-            stop_running_session(sess);
+            stop_running_session(sess, false);
         }
     }
 }
@@ -603,14 +604,18 @@ impl Drop for EtwTrackerManager {
 }
 
 #[cfg(windows)]
-fn stop_running_session(mut running: RunningEtwSession) {
+fn stop_running_session(mut running: RunningEtwSession, drain_final_buffers: bool) {
     use windows::core::PCWSTR;
     use windows::Win32::System::Diagnostics::Etw::{
         CloseTrace, ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_STOP,
         EVENT_TRACE_PROPERTIES, PROCESSTRACE_HANDLE,
     };
 
-    running.stop_flag.store(true, Ordering::SeqCst);
+    // Only short-circuit callback processing on cancel/teardown. On normal stop_session(), keep
+    // stop_flag false so ControlTraceW(STOP) flushes all final per-CPU buffers into our state.
+    if !drain_final_buffers {
+        running.stop_flag.store(true, Ordering::SeqCst);
+    }
 
     let name_wide: Vec<u16> = running
         .etw_session_name
@@ -639,10 +644,11 @@ fn stop_running_session(mut running: RunningEtwSession) {
             });
         }
     }
+    running.stop_flag.store(true, Ordering::SeqCst);
 }
 
 #[cfg(not(windows))]
-fn stop_running_session(_running: RunningEtwSession) {}
+fn stop_running_session(_running: RunningEtwSession, _drain_final_buffers: bool) {}
 
 #[cfg(windows)]
 fn build_trace_properties_buf(name_wide: &[u16]) -> Vec<u64> {
@@ -1150,11 +1156,13 @@ mod tests {
         let bound = mgr.bind_root_pid(&sid, self_pid).expect("bind_root_pid");
         assert!(bound.tracked_pid_count >= 1);
 
+        // Allow kernel provider enablement to settle across CPUs before writing the probe file.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+
         let dir = tempfile::tempdir().unwrap();
         let probe_file = dir.path().join("etw_probe_file.txt");
         std::fs::write(&probe_file, b"hello-etw").unwrap();
-        // Give ETW FlushTimer (1s) a brief window to deliver the kernel file event.
-        std::thread::sleep(std::time::Duration::from_millis(1250));
+        std::thread::sleep(std::time::Duration::from_millis(250));
 
         let capture = mgr.stop_session(&sid).expect("stop_session");
         // Windows kernel ETW reports canonical long paths (e.g. "runneradmin"), whereas
