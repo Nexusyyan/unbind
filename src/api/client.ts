@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
@@ -15,6 +16,7 @@ import type {
   LeftoverItem,
   LockingProcessInfo,
   OperationLogEntry,
+  PendingUpdateOutcome,
   PortableApp,
   RunningProcessInfo,
   ShellIntegrationStatus,
@@ -25,12 +27,57 @@ import type {
   TraySnapshot,
   UninstallExecutionResult,
   UpdateCheckResult,
+  UpdateProgressEvent,
+  UpdateStateSnapshot,
   WingetCheckResult,
   WingetUpgradeResult,
 } from "../types";
 
 export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+const PREVIEW_MOCK_UPDATE: UpdateCheckResult = {
+  currentVersion: "0.5.1",
+  latestVersion: "0.6.0",
+  latestTag: "v0.6.0",
+  hasUpdate: true,
+  releaseUrl: "https://github.com/Nexusyyan/unbind/releases/tag/v0.6.0",
+  publishedAt: "2026-11-26T08:00:00Z",
+  notesPreview:
+    "### Highlights\n- In-app verified self-updater with SHA-256 + PE integrity checks\n- One-click Restart to Update preserving portable data and settings\n- Silent startup update check with subtle titlebar status pill",
+  exeAssetName: "unbind-v0.6.0-x86_64-windows.exe",
+  exeAssetUrl:
+    "https://github.com/Nexusyyan/unbind/releases/download/v0.6.0/unbind-v0.6.0-x86_64-windows.exe",
+  exeAssetSize: 7_340_032,
+  checksumsUrl:
+    "https://github.com/Nexusyyan/unbind/releases/download/v0.6.0/SHA256SUMS.txt",
+};
+
+const EMPTY_UPDATE_PROGRESS: UpdateProgressEvent = {
+  stage: "idle",
+  version: "",
+  tag: "",
+  downloadedBytes: 0,
+  totalBytes: 0,
+  percent: 0,
+  error: null,
+  staged: null,
+};
+
+let previewUpdateCheck: UpdateCheckResult | null = null;
+let previewUpdateProgress: UpdateProgressEvent = { ...EMPTY_UPDATE_PROGRESS };
+let previewDownloadTimer: number | null = null;
+const previewProgressListeners = new Set<(event: UpdateProgressEvent) => void>();
+
+function emitPreviewProgress(next: UpdateProgressEvent) {
+  previewUpdateProgress = next;
+  previewProgressListeners.forEach((fn) => fn(next));
+}
+
+function getPreviewUpdateMode(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("previewUpdate");
 }
 
 export const api = {
@@ -42,7 +89,7 @@ export const api = {
         portableMode: true,
         dataDir: "C:\\Portable\\Unbind\\unbind-data",
         windowsVersion: "Windows 11 Preview",
-        appVersion: "0.5.0",
+        appVersion: "0.5.1",
       };
     }
     return invoke<SystemStatus>("get_system_status");
@@ -64,6 +111,7 @@ export const api = {
         portableAppRoots: [],
         defaultTrackMode: "hybridSnapshot",
         closeToTray: false,
+        autoCheckUpdates: true,
       };
     }
     return invoke<AppSettings>("get_settings");
@@ -77,7 +125,7 @@ export const api = {
   async getTraySnapshot(): Promise<TraySnapshot> {
     if (!isTauriRuntime()) {
       return {
-        appVersion: "0.5.0",
+        appVersion: "0.5.1",
         isElevated: false,
         workerConnected: false,
         portableMode: true,
@@ -314,7 +362,173 @@ export const api = {
   },
 
   async checkForUpdates(): Promise<UpdateCheckResult> {
+    if (!isTauriRuntime()) {
+      const mode = getPreviewUpdateMode();
+      if (mode === "uptodate") {
+        previewUpdateCheck = {
+          ...PREVIEW_MOCK_UPDATE,
+          latestVersion: "0.5.1",
+          latestTag: "v0.5.1",
+          hasUpdate: false,
+        };
+      } else {
+        previewUpdateCheck = { ...PREVIEW_MOCK_UPDATE };
+      }
+      return previewUpdateCheck;
+    }
     return invoke<UpdateCheckResult>("check_for_updates");
+  },
+
+  async getUpdateState(): Promise<UpdateStateSnapshot> {
+    if (!isTauriRuntime()) {
+      const mode = getPreviewUpdateMode();
+      if (mode === "available" && !previewUpdateCheck) {
+        previewUpdateCheck = { ...PREVIEW_MOCK_UPDATE };
+      } else if (mode === "ready" && !previewUpdateCheck) {
+        previewUpdateCheck = { ...PREVIEW_MOCK_UPDATE };
+        previewUpdateProgress = {
+          stage: "ready",
+          version: PREVIEW_MOCK_UPDATE.latestVersion,
+          tag: PREVIEW_MOCK_UPDATE.latestTag ?? "v0.6.0",
+          downloadedBytes: PREVIEW_MOCK_UPDATE.exeAssetSize ?? 7_340_032,
+          totalBytes: PREVIEW_MOCK_UPDATE.exeAssetSize ?? 7_340_032,
+          percent: 100,
+          error: null,
+          staged: {
+            version: PREVIEW_MOCK_UPDATE.latestVersion,
+            tag: PREVIEW_MOCK_UPDATE.latestTag ?? "v0.6.0",
+            assetName: PREVIEW_MOCK_UPDATE.exeAssetName ?? "unbind-v0.6.0-x86_64-windows.exe",
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            fileSize: PREVIEW_MOCK_UPDATE.exeAssetSize ?? 7_340_032,
+            stagedExePath: "C:\\Temp\\unbind-updater\\stage-0.6.0\\unbind.exe",
+            stagingDir: "C:\\Temp\\unbind-updater\\stage-0.6.0",
+          },
+        };
+      }
+      return {
+        latestCheck: previewUpdateCheck,
+        progress: previewUpdateProgress,
+      };
+    }
+    return invoke<UpdateStateSnapshot>("get_update_state");
+  },
+
+  async downloadUpdate(): Promise<UpdateProgressEvent> {
+    if (!isTauriRuntime()) {
+      const target = previewUpdateCheck ?? PREVIEW_MOCK_UPDATE;
+      const total = target.exeAssetSize ?? 7_340_032;
+      if (previewDownloadTimer !== null) {
+        window.clearInterval(previewDownloadTimer);
+      }
+      let pct = 12;
+      const startEv: UpdateProgressEvent = {
+        stage: "downloading",
+        version: target.latestVersion,
+        tag: target.latestTag ?? `v${target.latestVersion}`,
+        downloadedBytes: Math.round((total * pct) / 100),
+        totalBytes: total,
+        percent: pct,
+        error: null,
+        staged: null,
+      };
+      emitPreviewProgress(startEv);
+      previewDownloadTimer = window.setInterval(() => {
+        pct += 22;
+        if (pct < 100) {
+          emitPreviewProgress({
+            stage: "downloading",
+            version: target.latestVersion,
+            tag: target.latestTag ?? `v${target.latestVersion}`,
+            downloadedBytes: Math.round((total * pct) / 100),
+            totalBytes: total,
+            percent: pct,
+            error: null,
+            staged: null,
+          });
+        } else {
+          if (previewDownloadTimer !== null) {
+            window.clearInterval(previewDownloadTimer);
+            previewDownloadTimer = null;
+          }
+          emitPreviewProgress({
+            stage: "verifying",
+            version: target.latestVersion,
+            tag: target.latestTag ?? `v${target.latestVersion}`,
+            downloadedBytes: total,
+            totalBytes: total,
+            percent: 100,
+            error: null,
+            staged: null,
+          });
+          window.setTimeout(() => {
+            emitPreviewProgress({
+              stage: "ready",
+              version: target.latestVersion,
+              tag: target.latestTag ?? `v${target.latestVersion}`,
+              downloadedBytes: total,
+              totalBytes: total,
+              percent: 100,
+              error: null,
+              staged: {
+                version: target.latestVersion,
+                tag: target.latestTag ?? `v${target.latestVersion}`,
+                assetName: target.exeAssetName ?? "unbind-v0.6.0-x86_64-windows.exe",
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                fileSize: total,
+                stagedExePath: "C:\\Temp\\unbind-updater\\stage-0.6.0\\unbind.exe",
+                stagingDir: "C:\\Temp\\unbind-updater\\stage-0.6.0",
+              },
+            });
+          }, 420);
+        }
+      }, 240);
+      return startEv;
+    }
+    return invoke<UpdateProgressEvent>("download_update");
+  },
+
+  async cancelUpdateDownload(): Promise<boolean> {
+    if (!isTauriRuntime()) {
+      if (previewDownloadTimer !== null) {
+        window.clearInterval(previewDownloadTimer);
+        previewDownloadTimer = null;
+      }
+      emitPreviewProgress({ ...EMPTY_UPDATE_PROGRESS });
+      return true;
+    }
+    return invoke<boolean>("cancel_update_download");
+  },
+
+  async installStagedUpdate(): Promise<void> {
+    if (!isTauriRuntime()) {
+      emitPreviewProgress({
+        ...previewUpdateProgress,
+        stage: "installing",
+      });
+      return;
+    }
+    return invoke<void>("install_staged_update");
+  },
+
+  async consumeUpdateOutcome(): Promise<PendingUpdateOutcome | null> {
+    if (!isTauriRuntime()) return null;
+    return invoke<PendingUpdateOutcome | null>("consume_update_outcome");
+  },
+
+  async subscribeUpdateProgress(
+    handler: (event: UpdateProgressEvent) => void,
+  ): Promise<UnlistenFn> {
+    if (!isTauriRuntime()) {
+      previewProgressListeners.add(handler);
+      return () => {
+        previewProgressListeners.delete(handler);
+      };
+    }
+    return listen<UpdateProgressEvent>("update://progress", (e) => {
+      if (e.payload) {
+        handler(e.payload);
+      }
+    });
   },
 
   async takePendingCliAction(): Promise<CliAction | null> {

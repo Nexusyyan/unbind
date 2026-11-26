@@ -257,6 +257,7 @@ export interface AppSettings {
   portableAppRoots?: string[];
   defaultTrackMode?: TrackMode;
   closeToTray?: boolean;
+  autoCheckUpdates?: boolean;
   windowBounds?: WindowBounds | null;
 }
 
@@ -290,10 +291,57 @@ export interface SystemStatus {
 export interface UpdateCheckResult {
   currentVersion: string;
   latestVersion: string;
+  latestTag?: string;
   hasUpdate: boolean;
   releaseUrl: string;
   publishedAt: string;
   notesPreview: string;
+  exeAssetName?: string | null;
+  exeAssetUrl?: string | null;
+  exeAssetSize?: number | null;
+  checksumsUrl?: string | null;
+}
+
+export type UpdateStage =
+  | "idle"
+  | "downloading"
+  | "verifying"
+  | "ready"
+  | "installing"
+  | "failed";
+
+export interface StagedUpdateInfo {
+  version: string;
+  tag: string;
+  assetName: string;
+  sha256: string;
+  fileSize: number;
+  stagedExePath: string;
+  stagingDir: string;
+}
+
+export interface UpdateProgressEvent {
+  stage: UpdateStage;
+  version: string;
+  tag: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  error: string | null;
+  staged: StagedUpdateInfo | null;
+}
+
+export interface UpdateStateSnapshot {
+  latestCheck: UpdateCheckResult | null;
+  progress: UpdateProgressEvent;
+}
+
+export interface PendingUpdateOutcome {
+  success: boolean;
+  fromVersion: string;
+  toVersion: string;
+  error: string | null;
+  timestampMs: number;
 }
 
 export interface ShellIntegrationStatus {

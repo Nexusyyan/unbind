@@ -18,7 +18,7 @@ import type { AppSettings, TraySnapshot } from "../types";
 import { BrandLogo } from "./BrandLogo";
 
 const DEFAULT_SNAPSHOT: TraySnapshot = {
-  appVersion: "0.5.0",
+  appVersion: "0.5.1",
   isElevated: false,
   workerConnected: false,
   portableMode: false,

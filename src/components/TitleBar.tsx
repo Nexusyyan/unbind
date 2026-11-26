@@ -1,19 +1,22 @@
 import { useEffect, useState } from "react";
 import {
+  ArrowUpCircle,
   HardDrive,
   Languages,
+  Loader2,
   Maximize2,
   Minimize2,
   Minus,
   Monitor,
   Moon,
+  RotateCw,
   Shield,
   Sun,
   X,
 } from "lucide-react";
 import { api } from "../api/client";
 import type { Dict, Locale } from "../i18n";
-import type { SystemStatus } from "../types";
+import type { SystemStatus, UpdateCheckResult, UpdateProgressEvent } from "../types";
 import { BrandLogo } from "./BrandLogo";
 
 interface TitleBarProps {
@@ -21,9 +24,13 @@ interface TitleBarProps {
   locale: Locale;
   theme: string;
   status: SystemStatus | null;
+  updateCheck: UpdateCheckResult | null;
+  updateProgress: UpdateProgressEvent;
   onElevate: () => void;
   onToggleLocale: () => void;
   onCycleTheme: () => void;
+  onOpenUpdates: () => void;
+  onRestartToUpdate: () => void;
 }
 
 export function TitleBar({
@@ -31,9 +38,13 @@ export function TitleBar({
   locale,
   theme,
   status,
+  updateCheck,
+  updateProgress,
   onElevate,
   onToggleLocale,
   onCycleTheme,
+  onOpenUpdates,
+  onRestartToUpdate,
 }: TitleBarProps) {
   const [maximized, setMaximized] = useState(false);
 
@@ -59,6 +70,15 @@ export function TitleBar({
       : theme === "light"
         ? dict.settings.themeLight
         : dict.settings.themeSystem;
+  const updateStage = updateProgress.stage;
+  const showUpdatePill =
+    updateStage === "downloading" ||
+    updateStage === "verifying" ||
+    updateStage === "ready" ||
+    updateStage === "installing" ||
+    Boolean(updateCheck?.hasUpdate);
+  const updateVersion = updateProgress.version || updateCheck?.latestVersion || "";
+  const updatePercent = Math.round(updateProgress.percent);
 
   return (
     <header
@@ -84,6 +104,49 @@ export function TitleBar({
       </div>
 
       <div className="flex items-center gap-0.5">
+        {showUpdatePill && (
+          updateStage === "ready" ? (
+            <button
+              type="button"
+              onClick={onRestartToUpdate}
+              title={dict.settings.updateReadyHint}
+              className="mr-1 inline-flex h-6.5 items-center gap-1.5 rounded-full bg-[var(--accent-primary)] px-2.5 text-[11px] font-medium text-[var(--accent-primary-fg)] transition-colors duration-150 hover:bg-[var(--accent-primary-hover)] cursor-pointer"
+            >
+              <RotateCw className="h-3 w-3" strokeWidth={1.5} />
+              <span>{dict.settings.titlebarUpdateReady}</span>
+            </button>
+          ) : updateStage === "installing" ? (
+            <span className="mr-1 inline-flex h-6.5 items-center gap-1.5 rounded-full bg-[var(--bg-hover)] px-2.5 text-[11px] font-medium text-[var(--text-secondary)]">
+              <Loader2 className="h-3 w-3 animate-spin" strokeWidth={1.5} />
+              <span>{dict.settings.restartingToUpdate}</span>
+            </span>
+          ) : updateStage === "downloading" || updateStage === "verifying" ? (
+            <button
+              type="button"
+              onClick={onOpenUpdates}
+              className="mr-1 inline-flex h-6.5 items-center gap-1.5 rounded-full border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 text-[11px] font-medium text-[var(--text-primary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] cursor-pointer"
+            >
+              <Loader2 className="h-3 w-3 animate-spin text-[var(--text-tertiary)]" strokeWidth={1.5} />
+              <span className="num-tabular">
+                {updateStage === "verifying"
+                  ? dict.settings.titlebarUpdating.replace("{percent}", "99")
+                  : dict.settings.titlebarUpdating.replace("{percent}", String(updatePercent))}
+              </span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenUpdates}
+              className="mr-1 inline-flex h-6.5 items-center gap-1.5 rounded-full border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-2.5 text-[11px] font-medium text-[var(--text-primary)] transition-colors duration-150 hover:bg-[var(--bg-hover)] cursor-pointer"
+            >
+              <ArrowUpCircle className="h-3 w-3 text-[var(--text-secondary)]" strokeWidth={1.5} />
+              <span className="num-tabular">
+                {dict.settings.titlebarUpdateNew.replace("{version}", updateVersion)}
+              </span>
+            </button>
+          )
+        )}
+
         <button
           type="button"
           onClick={onElevate}

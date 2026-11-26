@@ -34,6 +34,8 @@ import type {
   ToastMessage,
   ToolsSubTab,
   TrayNavigatePayload,
+  UpdateCheckResult,
+  UpdateProgressEvent,
   WingetUpdateInfo,
 } from "./types";
 
@@ -51,7 +53,22 @@ const DEFAULT_SETTINGS: AppSettings = {
   portableAppRoots: [],
   defaultTrackMode: "hybridSnapshot",
   closeToTray: false,
+  autoCheckUpdates: true,
 };
+
+const EMPTY_UPDATE_PROGRESS: UpdateProgressEvent = {
+  stage: "idle",
+  version: "",
+  tag: "",
+  downloadedBytes: 0,
+  totalBytes: 0,
+  percent: 0,
+  error: null,
+  staged: null,
+};
+
+const AUTO_UPDATE_STORAGE_KEY = "unbind:lastAutoUpdateCheckMs";
+const AUTO_UPDATE_INTERVAL_MS = 12 * 60 * 60 * 1000;
 
 const DEFAULT_LIST_STATE: AppListViewState = {
   query: "",
@@ -103,6 +120,13 @@ export function App() {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [dragHover, setDragHover] = useState(false);
   const [droppedInstallerPath, setDroppedInstallerPath] = useState<string | null>(null);
+
+  // App self-update state (lifted so TitleBar & Settings stay in sync across tabs)
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckResult | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressEvent>(EMPTY_UPDATE_PROGRESS);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [focusUpdatesSeq, setFocusUpdatesSeq] = useState(0);
+  const autoCheckedRef = useRef(false);
 
   // Modal states
   const [wizardState, setWizardState] = useState<{
@@ -256,16 +280,93 @@ export function App() {
     }
   }, []);
 
-  // Initial load + pending CLI action check
+  const handleCheckSelfUpdates = useCallback(
+    async (silent = false) => {
+      setCheckingUpdate(true);
+      try {
+        const res = await api.checkForUpdates();
+        setUpdateCheck(res);
+      } catch (err) {
+        if (!silent) {
+          notify("error", dictRef.current.settings.checkUpdates, String(err));
+        }
+      } finally {
+        setCheckingUpdate(false);
+      }
+    },
+    [notify],
+  );
+
+  const handleStartSelfUpdate = useCallback(async () => {
+    try {
+      const next = await api.downloadUpdate();
+      setUpdateProgress(next);
+    } catch (err) {
+      notify("error", dictRef.current.settings.updateFailedTitle, String(err));
+    }
+  }, [notify]);
+
+  const handleCancelSelfUpdate = useCallback(async () => {
+    try {
+      await api.cancelUpdateDownload();
+    } catch {
+      // Ignore cancel race errors
+    }
+  }, []);
+
+  const handleRestartToUpdate = useCallback(async () => {
+    try {
+      await api.installStagedUpdate();
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("UPDATE_ELEVATION_CANCELLED")) {
+        notify(
+          "warning",
+          dictRef.current.settings.restartToUpdate,
+          dictRef.current.settings.updateElevationCancelled,
+        );
+      } else {
+        notify("error", dictRef.current.settings.updateFailedTitle, msg);
+      }
+    }
+  }, [notify]);
+
+  const handleOpenUpdatesSection = useCallback(() => {
+    setActiveTab("settings");
+    setFocusUpdatesSeq((n) => n + 1);
+  }, []);
+
+  // Initial load + pending CLI action check + update state hydration
   useEffect(() => {
     void (async () => {
-      const [st, cfg, pendingAction] = await Promise.all([
+      const [st, cfg, pendingAction, updateSnap, updateOutcome] = await Promise.all([
         api.getSystemStatus(),
         api.getSettings(),
         api.takePendingCliAction(),
+        api.getUpdateState().catch(() => null),
+        api.consumeUpdateOutcome().catch(() => null),
       ]);
       setStatus(st);
       setSettings(cfg);
+      if (updateSnap) {
+        setUpdateCheck(updateSnap.latestCheck);
+        setUpdateProgress(updateSnap.progress);
+      }
+      if (updateOutcome) {
+        if (updateOutcome.success) {
+          notify(
+            "success",
+            dictRef.current.settings.updatedToastTitle.replace("{version}", updateOutcome.toVersion),
+            dictRef.current.settings.updatedToastDetail.replace("{from}", updateOutcome.fromVersion),
+          );
+        } else {
+          notify(
+            "warning",
+            dictRef.current.settings.updateRollbackToastTitle,
+            updateOutcome.error ?? undefined,
+          );
+        }
+      }
       if (pendingAction) {
         handleCliAction(pendingAction);
       }
@@ -274,6 +375,32 @@ export function App() {
       void refreshPortableApps(cfg.portableAppRoots ?? []);
       void refreshTracker();
       void refreshBackupsAndLogs();
+
+      // Silent background update check on startup (at most once every 12h when enabled).
+      if (
+        isTauriRuntime() &&
+        cfg.autoCheckUpdates !== false &&
+        !autoCheckedRef.current
+      ) {
+        autoCheckedRef.current = true;
+        let lastCheck = 0;
+        try {
+          lastCheck = Number(window.localStorage.getItem(AUTO_UPDATE_STORAGE_KEY) || "0");
+        } catch {
+          lastCheck = 0;
+        }
+        const now = Date.now();
+        if (now - lastCheck >= AUTO_UPDATE_INTERVAL_MS) {
+          window.setTimeout(() => {
+            try {
+              window.localStorage.setItem(AUTO_UPDATE_STORAGE_KEY, String(Date.now()));
+            } catch {
+              // Ignore storage quota errors
+            }
+            void handleCheckSelfUpdates(true);
+          }, 2500);
+        }
+      }
     })();
   }, [
     refreshApps,
@@ -282,7 +409,24 @@ export function App() {
     refreshTracker,
     refreshBackupsAndLogs,
     handleCliAction,
+    handleCheckSelfUpdates,
+    notify,
   ]);
+
+  // Subscribe to self-update download/verification progress events (works in both Tauri and preview)
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    void api
+      .subscribeUpdateProgress((ev) => {
+        setUpdateProgress(ev);
+      })
+      .then((fn) => {
+        unsub = fn;
+      });
+    return () => {
+      if (unsub) unsub();
+    };
+  }, []);
 
   // Listen to backend streaming events (async real sizes, installer exit, single-instance CLI)
   useEffect(() => {
@@ -704,9 +848,13 @@ export function App() {
         locale={locale}
         theme={settings.theme}
         status={status}
+        updateCheck={updateCheck}
+        updateProgress={updateProgress}
         onElevate={handleElevate}
         onToggleLocale={handleToggleLocale}
         onCycleTheme={handleCycleTheme}
+        onOpenUpdates={handleOpenUpdatesSection}
+        onRestartToUpdate={() => void handleRestartToUpdate()}
       />
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
@@ -819,6 +967,14 @@ export function App() {
               locale={locale}
               settings={settings}
               status={status}
+              updateCheck={updateCheck}
+              updateProgress={updateProgress}
+              checkingUpdate={checkingUpdate}
+              focusUpdatesSeq={focusUpdatesSeq}
+              onCheckUpdates={() => void handleCheckSelfUpdates(false)}
+              onStartUpdate={() => void handleStartSelfUpdate()}
+              onCancelUpdate={() => void handleCancelSelfUpdate()}
+              onRestartToUpdate={() => void handleRestartToUpdate()}
               onSave={(next) => handleSaveSettings(next, true)}
               onNotify={notify}
             />

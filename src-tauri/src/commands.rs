@@ -1,4 +1,5 @@
 use crate::elevation::ElevationBridge;
+use crate::self_update::{launch_self_update_helper, UpdateRuntimeState};
 use crate::tray::{
     self, TrayNavigatePayload, TrayRuntimeState, TraySnapshot, TRAY_LOGICAL_WIDTH,
     TRAY_WINDOW_LABEL,
@@ -20,9 +21,10 @@ use unbind_core::ipc::WorkerRequest;
 use unbind_core::models::{
     ActiveTrackSession, AppKind, AppSettings, BackupEntry, CleanupOptions, CleanupReport,
     CoreError, EtwCaptureResult, EtwSessionStats, ExportFormat, InstallScope, InstallTrace,
-    InstalledApp, LeftoverItem, LockingProcessInfo, OperationLogEntry, PortableApp,
-    RunningProcessInfo, ShellIntegrationStatus, ShortcutLocation, StartupItem, SystemStatus,
-    TrackMode, UninstallExecutionResult, UpdateCheckResult, WingetCheckResult, WingetUpgradeResult,
+    InstalledApp, LeftoverItem, LockingProcessInfo, OperationLogEntry, PendingUpdateOutcome,
+    PortableApp, RunningProcessInfo, ShellIntegrationStatus, ShortcutLocation, StartupItem,
+    SystemStatus, TrackMode, UninstallExecutionResult, UpdateCheckResult, UpdateProgressEvent,
+    UpdateStage, UpdateStateSnapshot, WingetCheckResult, WingetUpgradeResult,
 };
 use unbind_core::portable::AppStorage;
 use unbind_core::portable_apps::{
@@ -51,7 +53,10 @@ use unbind_core::uninstaller::{execute_cleanup, run_native_uninstaller};
 use unbind_core::unlocker::{
     find_locking_processes, find_running_processes_in_dir, terminate_processes,
 };
-use unbind_core::updater::check_github_release;
+use unbind_core::updater::{
+    check_github_release, consume_update_outcome as core_consume_update_outcome,
+    download_and_stage_update, UPDATE_CANCELLED_CODE,
+};
 use unbind_core::winget::{
     check_winget_updates as core_check_winget_updates,
     run_winget_upgrade as core_run_winget_upgrade,
@@ -68,6 +73,7 @@ pub struct AppState {
     pub size_scan_gen: Arc<AtomicU64>,
     pub pending_cli_action: Mutex<Option<CliAction>>,
     pub tray: TrayRuntimeState,
+    pub updates: Arc<UpdateRuntimeState>,
 }
 
 impl AppState {
@@ -82,6 +88,7 @@ impl AppState {
             size_scan_gen: Arc::new(AtomicU64::new(0)),
             pending_cli_action: Mutex::new(initial_cli_action),
             tray: TrayRuntimeState::new(),
+            updates: Arc::new(UpdateRuntimeState::new()),
         }
     }
 
@@ -992,12 +999,236 @@ pub fn set_shell_integration(
 }
 
 #[tauri::command]
-pub async fn check_for_updates() -> Result<UpdateCheckResult, String> {
+pub async fn check_for_updates(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateCheckResult, String> {
     let cur = env!("CARGO_PKG_VERSION").to_string();
-    tauri::async_runtime::spawn_blocking(move || check_github_release(&cur))
+    let res = tauri::async_runtime::spawn_blocking(move || check_github_release(&cur))
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    state.updates.set_latest_check(res.clone());
+
+    let prev = state.updates.progress();
+    let keep_progress = matches!(
+        prev.stage,
+        UpdateStage::Downloading | UpdateStage::Verifying | UpdateStage::Installing
+    ) || (prev.stage == UpdateStage::Ready
+        && prev.version == res.latest_version
+        && state.updates.valid_staged_update().is_some());
+
+    if !keep_progress && prev.stage != UpdateStage::Idle {
+        let idle = UpdateProgressEvent::default();
+        state.updates.set_progress(idle.clone());
+        let _ = app_handle.emit("update://progress", &idle);
+    }
+
+    Ok(res)
+}
+
+#[tauri::command]
+pub fn get_update_state(state: State<'_, AppState>) -> UpdateStateSnapshot {
+    state.updates.snapshot()
+}
+
+#[tauri::command]
+pub async fn download_update(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateProgressEvent, String> {
+    let cur = env!("CARGO_PKG_VERSION").to_string();
+    let check = match state.updates.latest_check() {
+        Some(existing) if existing.has_update => existing,
+        _ => {
+            let cur_clone = cur.clone();
+            let fresh =
+                tauri::async_runtime::spawn_blocking(move || check_github_release(&cur_clone))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+            state.updates.set_latest_check(fresh.clone());
+            fresh
+        }
+    };
+
+    if !check.has_update {
+        return Err("Unbind is already up to date".to_string());
+    }
+
+    // Reuse an already verified staged file for the same version instead of re-downloading.
+    let current_progress = state.updates.progress();
+    if current_progress.stage == UpdateStage::Ready
+        && current_progress.version == check.latest_version
+        && state.updates.valid_staged_update().is_some()
+    {
+        let _ = app_handle.emit("update://progress", &current_progress);
+        return Ok(current_progress);
+    }
+
+    if !state.updates.try_begin_download() {
+        return Ok(state.updates.progress());
+    }
+
+    let initial = UpdateProgressEvent {
+        stage: UpdateStage::Downloading,
+        version: check.latest_version.clone(),
+        tag: check.latest_tag.clone(),
+        downloaded_bytes: 0,
+        total_bytes: check.exe_asset_size.unwrap_or(0),
+        percent: 0.0,
+        error: None,
+        staged: None,
+    };
+    state.updates.set_progress(initial.clone());
+    let _ = app_handle.emit("update://progress", &initial);
+
+    let updates_arc = Arc::clone(&state.updates);
+    let cancel_flag = state.updates.cancel_flag();
+    let app_clone = app_handle.clone();
+    let ver = check.latest_version.clone();
+    let tag = check.latest_tag.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let res = download_and_stage_update(&check, &cur, &cancel_flag, |downloaded, total, verifying| {
+            let pct = if verifying {
+                100.0
+            } else if total > 0 {
+                ((downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as f32
+            } else {
+                0.0
+            };
+            let ev = UpdateProgressEvent {
+                stage: if verifying {
+                    UpdateStage::Verifying
+                } else {
+                    UpdateStage::Downloading
+                },
+                version: ver.clone(),
+                tag: tag.clone(),
+                downloaded_bytes: downloaded,
+                total_bytes: total,
+                percent: pct,
+                error: None,
+                staged: None,
+            };
+            updates_arc.set_progress(ev.clone());
+            let _ = app_clone.emit("update://progress", &ev);
+        });
+
+        match res {
+            Ok(staged) => {
+                let ready = UpdateProgressEvent {
+                    stage: UpdateStage::Ready,
+                    version: staged.version.clone(),
+                    tag: staged.tag.clone(),
+                    downloaded_bytes: staged.file_size,
+                    total_bytes: staged.file_size,
+                    percent: 100.0,
+                    error: None,
+                    staged: Some(staged),
+                };
+                updates_arc.set_progress(ready.clone());
+                let _ = app_clone.emit("update://progress", &ready);
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                let next = if msg.contains(UPDATE_CANCELLED_CODE) {
+                    UpdateProgressEvent::default()
+                } else {
+                    UpdateProgressEvent {
+                        stage: UpdateStage::Failed,
+                        version: ver.clone(),
+                        tag: tag.clone(),
+                        downloaded_bytes: 0,
+                        total_bytes: check.exe_asset_size.unwrap_or(0),
+                        percent: 0.0,
+                        error: Some(msg),
+                        staged: None,
+                    }
+                };
+                updates_arc.set_progress(next.clone());
+                let _ = app_clone.emit("update://progress", &next);
+            }
+        }
+        updates_arc.finish_download();
+    });
+
+    Ok(initial)
+}
+
+#[tauri::command]
+pub fn cancel_update_download(app_handle: AppHandle, state: State<'_, AppState>) -> bool {
+    let requested = state.updates.request_cancel();
+    if !requested {
+        let cur = state.updates.progress();
+        if cur.stage == UpdateStage::Failed {
+            let idle = UpdateProgressEvent::default();
+            state.updates.set_progress(idle.clone());
+            let _ = app_handle.emit("update://progress", &idle);
+        }
+    }
+    requested
+}
+
+#[tauri::command]
+pub async fn install_staged_update(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let staged = state
+        .updates
+        .valid_staged_update()
+        .ok_or_else(|| "No verified update is ready to install".to_string())?;
+
+    let from_version = env!("CARGO_PKG_VERSION").to_string();
+    let worker_pid = state.elevation.worker_pid();
+
+    // Launch the temporary `--apply-update` helper FIRST so if UAC is cancelled,
+    // the app (and any active elevated worker session) stays intact and responsive.
+    launch_self_update_helper(&staged, &from_version, worker_pid)?;
+
+    let installing = UpdateProgressEvent {
+        stage: UpdateStage::Installing,
+        version: staged.version.clone(),
+        tag: staged.tag.clone(),
+        downloaded_bytes: staged.file_size,
+        total_bytes: staged.file_size,
+        percent: 100.0,
+        error: None,
+        staged: Some(staged.clone()),
+    };
+    state.updates.set_progress(installing.clone());
+    let _ = app_handle.emit("update://progress", &installing);
+
+    let storage = state.current_storage();
+    let _ = storage.append_log(
+        "self_update",
+        &format!("v{}", staged.version),
+        "Launching restart-to-update helper",
+        true,
+    );
+
+    // Release ETW sessions, elevated worker, tray popup, and window bounds before exiting.
+    unbind_core::ipc::worker_etw_manager().stop_all_sessions();
+    let _ = state.elevation.shutdown();
+    tray::hide_tray_menu(&app_handle);
+    state.tray.mark_exiting();
+    crate::persist_main_window_bounds(&app_handle, &state);
+
+    let exit_handle = app_handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        exit_handle.exit(0);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn consume_update_outcome() -> Option<PendingUpdateOutcome> {
+    core_consume_update_outcome()
 }
 
 #[tauri::command]

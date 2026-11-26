@@ -4,6 +4,17 @@ All notable changes to **Unbind** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-26
+
+### Added
+- **In-App Verified Self-Updater & One-Click Restart to Update (`updater.rs`, `self_update.rs`)**: Replaced manual browser-download links with native WinHTTP streaming downloads (env proxy -> automatic proxy -> direct fallback), explicit GitHub/CDN HTTPS redirect allowlist, mandatory `SHA256SUMS.txt` SHA-256 and Windows PE (`MZ` / `PE\0\0`) verification, detached `%TEMP%` `--apply-update` helper with automatic cross-volume atomic swap & rollback, on-demand UAC elevation only for read-only install directories, Explorer-token privilege drop (`CreateProcessWithTokenW`) on GUI relaunch, and post-update outcome toasts.
+- **Silent Startup Update Check & TitleBar Pill**: Lifted update state into `App.tsx` with a 12-hour throttled silent startup check toggle (`AppSettings.auto_check_updates`), a restrained monochrome TitleBar status pill (`Update vX.Y.Z` / live progress / `Restart to Update`), inline Settings progress bar with cancel/retry controls, and collapsible release notes.
+- **Custom CSS-Styled Bilingual System Tray Popover (`tray.rs`, `TrayMenuApp.tsx`)**: Added a frameless transparent `tray-menu` popup aligned with `DESIGN.md` Light/Dark tokens, live `EN / ZH` and `System / Light / Dark` controls synced across windows, localized hover tooltips, optional Close-to-Tray behavior (`AppSettings.close_to_tray`), and clean full-exit handling.
+
+### Fixed
+- **ETW Final Buffer Draining (`etw_tracker.rs`)**: Kept the ETW callback active until `ControlTraceW(STOP)` finishes flushing per-CPU buffers so tail installer events are never dropped on session stop.
+- **SemVer Prerelease Comparison (`updater.rs`)**: Fixed prerelease-to-stable comparisons (e.g. `0.6.0-beta.1` -> `0.6.0`) and tightened GitHub release URL validation.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added

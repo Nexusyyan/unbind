@@ -1,5 +1,6 @@
 mod commands;
 mod elevation;
+pub mod self_update;
 mod tray;
 
 use commands::AppState;
@@ -153,6 +154,15 @@ pub fn run(initial_cli_action: Option<CliAction>) {
                 }
             }
             tray::setup_tray(app)?;
+
+            // Clean up any leftover `.old` executable or expired updater temp artifacts asynchronously.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                if let Ok(exe) = std::env::current_exe() {
+                    unbind_core::updater::cleanup_stale_update_artifacts(&exe);
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -233,6 +243,11 @@ pub fn run(initial_cli_action: Option<CliAction>) {
             commands::get_shell_integration_status,
             commands::set_shell_integration,
             commands::check_for_updates,
+            commands::get_update_state,
+            commands::download_update,
+            commands::cancel_update_download,
+            commands::install_staged_update,
+            commands::consume_update_outcome,
             commands::take_pending_cli_action,
         ])
         .build(tauri::generate_context!())

@@ -6,6 +6,7 @@ use unbind_core::safety::is_process_elevated;
 
 struct WorkerSession {
     pipe: File,
+    pid: u32,
 }
 
 /// Manages an on-demand, reusable elevated worker session over a PID-verified Windows Named Pipe.
@@ -102,14 +103,27 @@ impl ElevationBridge {
         Ok(())
     }
 
-    pub fn shutdown(&self) {
+    pub fn worker_pid(&self) -> Option<u32> {
+        self.session
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.pid))
+            .filter(|&pid| pid > 4)
+    }
+
+    pub fn shutdown(&self) -> Option<u32> {
         if let Ok(mut guard) = self.session.lock() {
             if let Some(mut sess) = guard.take() {
+                let pid = if sess.pid > 4 { Some(sess.pid) } else { None };
                 if let Ok(bytes) = serde_json::to_vec(&WorkerRequest::Shutdown) {
-                    let _ = write_frame(&mut sess.pipe, &bytes);
+                    if write_frame(&mut sess.pipe, &bytes).is_ok() {
+                        let _ = read_frame(&mut sess.pipe);
+                    }
                 }
+                return pid;
             }
         }
+        None
     }
 }
 
@@ -217,16 +231,16 @@ fn spawn_elevated_worker_session() -> CoreResult<WorkerSession> {
         }
 
         // Verify connected peer PID matches spawned elevated worker PID when available.
-        if expected_child_pid != 0 {
-            let mut client_pid = 0u32;
-            if GetNamedPipeClientProcessId(pipe_handle, &mut client_pid).is_ok()
-                && client_pid != expected_child_pid
-            {
+        let mut connected_pid = expected_child_pid;
+        let mut client_pid = 0u32;
+        if GetNamedPipeClientProcessId(pipe_handle, &mut client_pid).is_ok() && client_pid != 0 {
+            if expected_child_pid != 0 && client_pid != expected_child_pid {
                 let _ = CloseHandle(pipe_handle);
                 return Err(CoreError::Ipc(
                     "Rejected unexpected process on elevation pipe".to_string(),
                 ));
             }
+            connected_pid = client_pid;
         }
 
         let mut file = File::from_raw_handle(pipe_handle.0 as *mut _);
@@ -238,7 +252,10 @@ fn spawn_elevated_worker_session() -> CoreResult<WorkerSession> {
             WorkerRequest::Auth { token: got } if got == token => {
                 let ack = serde_json::to_vec(&WorkerResponse::Ok(serde_json::json!({"ok": true})))?;
                 write_frame(&mut file, &ack)?;
-                Ok(WorkerSession { pipe: file })
+                Ok(WorkerSession {
+                    pipe: file,
+                    pid: connected_pid,
+                })
             }
             _ => {
                 let rej = serde_json::to_vec(&WorkerResponse::Err("Invalid token".into()))?;

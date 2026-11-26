@@ -1,7 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  AlertCircle,
   AppWindow,
   Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Download,
   ExternalLink,
   FolderOpen,
   FolderPlus,
@@ -9,6 +14,7 @@ import {
   Loader2,
   MousePointerClick,
   RefreshCw,
+  RotateCw,
   Shield,
   X,
 } from "lucide-react";
@@ -20,7 +26,9 @@ import type {
   SystemStatus,
   TrackMode,
   UpdateCheckResult,
+  UpdateProgressEvent,
 } from "../types";
+import { formatBytes } from "../utils/format";
 import { BrandLogo } from "./BrandLogo";
 
 interface SettingsViewProps {
@@ -28,6 +36,14 @@ interface SettingsViewProps {
   locale: Locale;
   settings: AppSettings;
   status: SystemStatus | null;
+  updateCheck: UpdateCheckResult | null;
+  updateProgress: UpdateProgressEvent;
+  checkingUpdate: boolean;
+  focusUpdatesSeq: number;
+  onCheckUpdates: () => void;
+  onStartUpdate: () => void;
+  onCancelUpdate: () => void;
+  onRestartToUpdate: () => void;
   onSave: (next: AppSettings) => Promise<void>;
   onNotify: (kind: "info" | "success" | "warning" | "error", title: string, detail?: string) => void;
 }
@@ -37,6 +53,14 @@ export function SettingsView({
   locale,
   settings,
   status,
+  updateCheck,
+  updateProgress,
+  checkingUpdate,
+  focusUpdatesSeq,
+  onCheckUpdates,
+  onStartUpdate,
+  onCancelUpdate,
+  onRestartToUpdate,
   onSave,
   onNotify,
 }: SettingsViewProps) {
@@ -49,9 +73,8 @@ export function SettingsView({
     registeredExe: "",
   });
   const [shellBusy, setShellBusy] = useState(false);
-
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [showReleaseNotes, setShowReleaseNotes] = useState(false);
+  const updatesSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     void api
@@ -59,6 +82,12 @@ export function SettingsView({
       .then(setShellStatus)
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (focusUpdatesSeq > 0) {
+      updatesSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [focusUpdatesSeq]);
 
   const updateSettings = async (patch: Partial<AppSettings>) => {
     const next: AppSettings = { ...settings, ...patch };
@@ -111,17 +140,15 @@ export function SettingsView({
     await updateSettings({ portableAppRoots: current.filter((r) => r !== root) });
   };
 
-  const handleCheckUpdates = async () => {
-    setCheckingUpdate(true);
-    try {
-      const res = await api.checkForUpdates();
-      setUpdateResult(res);
-    } catch (err) {
-      onNotify("error", dict.settings.checkUpdates, String(err));
-    } finally {
-      setCheckingUpdate(false);
-    }
-  };
+  const updateStage = updateProgress.stage;
+  const updateBusy =
+    updateStage === "downloading" ||
+    updateStage === "verifying" ||
+    updateStage === "installing";
+  const canInAppUpdate = Boolean(updateCheck?.exeAssetUrl && updateCheck?.checksumsUrl);
+  const displayVersion = updateProgress.version || updateCheck?.latestVersion || "";
+  const progressPercent = Math.min(100, Math.max(0, Math.round(updateProgress.percent)));
+  const releaseNotesText = updateCheck?.notesPreview?.trim() ?? "";
 
   const themeOptions: Array<{ value: string; label: string }> = [
     { value: "system", label: dict.settings.themeSystem },
@@ -504,8 +531,11 @@ export function SettingsView({
           </div>
         </section>
 
-        {/* About & Native WinHTTP Release Update Check */}
-        <section className="ui-card space-y-2.5 p-5 text-[12px] text-[var(--text-secondary)]">
+        {/* About & In-App Self-Updater */}
+        <section
+          ref={updatesSectionRef}
+          className="ui-card space-y-3.5 p-5 text-[12px] text-[var(--text-secondary)]"
+        >
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-[13.5px] font-medium text-[var(--text-primary)]">
               <BrandLogo className="h-4 w-4 text-[var(--text-primary)]" />
@@ -513,8 +543,8 @@ export function SettingsView({
             </div>
             <button
               type="button"
-              disabled={checkingUpdate}
-              onClick={handleCheckUpdates}
+              disabled={checkingUpdate || updateBusy}
+              onClick={onCheckUpdates}
               className="ui-btn-secondary h-7.5 px-2.5 text-[12px]"
             >
               <RefreshCw
@@ -527,41 +557,229 @@ export function SettingsView({
             </button>
           </div>
 
-          <div className="pt-0.5">
-            {dict.settings.versionLabel}{" "}
-            <span className="num-tabular font-mono text-[var(--text-primary)]">
-              v{status?.appVersion ?? "0.5.0"}
-            </span>{" "}
-            | Tauri v2 + Rust (windows-rs) + React / TypeScript
-          </div>
-          <div className="num-tabular text-[var(--text-tertiary)]">
-            {status?.windowsVersion ?? "Windows"}
+          <div className="space-y-0.5">
+            <div>
+              {dict.settings.versionLabel}{" "}
+              <span className="num-tabular font-mono text-[var(--text-primary)]">
+                v{status?.appVersion ?? "0.5.1"}
+              </span>{" "}
+              | Tauri v2 + Rust (windows-rs) + React / TypeScript
+            </div>
+            <div className="num-tabular text-[var(--text-tertiary)]">
+              {status?.windowsVersion ?? "Windows"}
+            </div>
           </div>
 
-          {updateResult && (
-            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-[10px] border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-3.5 py-2.5">
-              <div className="num-tabular text-[12px] text-[var(--text-primary)]">
-                {updateResult.hasUpdate ? (
-                  <>
-                    <span className="font-medium">{dict.settings.updateAvailable}:</span>{" "}
-                    <span className="font-mono">v{updateResult.latestVersion}</span>
-                  </>
-                ) : (
-                  <span className="text-[var(--success-text)]">
-                    {dict.settings.upToDate} (v{updateResult.latestVersion})
+          <div className="h-px bg-[var(--border-hairline)]" />
+
+          <ToggleRow
+            label={dict.settings.autoCheckUpdatesLabel}
+            checked={settings.autoCheckUpdates !== false}
+            onChange={(v) => void updateSettings({ autoCheckUpdates: v })}
+          />
+
+          {/* In-app download / verification / ready / failed status panel */}
+          {(updateStage !== "idle" || updateCheck) && (
+            <div
+              className={`rounded-[10px] border px-3.5 py-3 ${
+                updateStage === "failed"
+                  ? "border-[var(--danger-border)] bg-[var(--danger-bg-hover)]"
+                  : "border-[var(--border-hairline)] bg-[var(--bg-subtle)]"
+              }`}
+            >
+              {updateStage === "downloading" || updateStage === "verifying" ? (
+                <div className="space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-[12.5px] font-medium text-[var(--text-primary)]">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--text-secondary)]" strokeWidth={1.5} />
+                      <span>
+                        {updateStage === "verifying"
+                          ? dict.settings.verifyingUpdate
+                          : dict.settings.downloadingUpdate.replace("{version}", displayVersion)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2.5">
+                      <span className="num-tabular font-mono text-[11.5px] text-[var(--text-secondary)]">
+                        {updateProgress.totalBytes > 0
+                          ? `${formatBytes(updateProgress.downloadedBytes)} / ${formatBytes(updateProgress.totalBytes)} (${progressPercent}%)`
+                          : updateProgress.downloadedBytes > 0
+                            ? formatBytes(updateProgress.downloadedBytes)
+                            : `${progressPercent}%`}
+                      </span>
+                      {updateStage === "downloading" && (
+                        <button
+                          type="button"
+                          onClick={onCancelUpdate}
+                          className="ui-btn-ghost h-6.5 px-2 text-[11.5px]"
+                        >
+                          {dict.common.cancel}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-track)]">
+                    <div
+                      className="h-full rounded-full bg-[var(--accent-primary)] transition-[width] duration-150"
+                      style={{
+                        width: `${updateStage === "verifying" ? 100 : Math.max(4, progressPercent)}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : updateStage === "ready" ? (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-[var(--success-text)]">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+                      <span className="num-tabular">
+                        {dict.settings.updateReadyTitle.replace("{version}", displayVersion)}
+                      </span>
+                    </div>
+                    <p className="text-[11.5px] text-[var(--text-secondary)]">
+                      {dict.settings.updateReadyHint}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onRestartToUpdate}
+                    className="ui-btn-primary h-7.5 shrink-0 px-3 text-[12px]"
+                  >
+                    <RotateCw className="h-3.5 w-3.5" strokeWidth={1.5} />
+                    <span>{dict.settings.restartToUpdate}</span>
+                  </button>
+                </div>
+              ) : updateStage === "installing" ? (
+                <div className="flex items-center gap-2 text-[12.5px] font-medium text-[var(--text-primary)]">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--text-secondary)]" strokeWidth={1.5} />
+                  <span>{dict.settings.restartingToUpdate}</span>
+                </div>
+              ) : updateStage === "failed" ? (
+                <div className="space-y-2.5">
+                  <div className="flex flex-wrap items-start justify-between gap-2.5">
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-[var(--danger-text)]">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+                        <span>{dict.settings.updateFailedTitle}</span>
+                      </div>
+                      {updateProgress.error && (
+                        <p className="font-mono text-[11px] break-all text-[var(--text-secondary)]">
+                          {updateProgress.error}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {canInAppUpdate && (
+                        <button
+                          type="button"
+                          onClick={onStartUpdate}
+                          className="ui-btn-primary h-7 px-2.5 text-[11.5px]"
+                        >
+                          <Download className="h-3 w-3" strokeWidth={1.5} />
+                          <span>{dict.settings.retryUpdate}</span>
+                        </button>
+                      )}
+                      {updateCheck?.releaseUrl && (
+                        <button
+                          type="button"
+                          onClick={() => api.openExternalUrl(updateCheck.releaseUrl)}
+                          className="ui-btn-secondary h-7 px-2.5 text-[11.5px]"
+                        >
+                          <ExternalLink className="h-3 w-3" strokeWidth={1.5} />
+                          <span>{dict.settings.openRelease}</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : updateCheck?.hasUpdate ? (
+                <div className="space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="num-tabular text-[12.5px] text-[var(--text-primary)]">
+                        <span className="font-medium">{dict.settings.updateAvailable}:</span>{" "}
+                        <span className="font-mono">v{updateCheck.latestVersion}</span>
+                        {updateCheck.publishedAt && (
+                          <span className="ml-2 text-[11.5px] text-[var(--text-tertiary)]">
+                            {updateCheck.publishedAt.slice(0, 10)}
+                          </span>
+                        )}
+                      </div>
+                      {!canInAppUpdate && (
+                        <p className="text-[11.5px] text-[var(--text-secondary)]">
+                          {dict.settings.updateNoAsset}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {canInAppUpdate ? (
+                        <button
+                          type="button"
+                          onClick={onStartUpdate}
+                          className="ui-btn-primary h-7.5 px-3 text-[12px]"
+                        >
+                          <Download className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          <span className="num-tabular">
+                            {updateCheck.exeAssetSize && updateCheck.exeAssetSize > 0
+                              ? `${dict.settings.updateNow} (${formatBytes(updateCheck.exeAssetSize)})`
+                              : dict.settings.updateNow}
+                          </span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => api.openExternalUrl(updateCheck.releaseUrl)}
+                          className="ui-btn-primary h-7.5 px-3 text-[12px]"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          <span>{dict.settings.openRelease}</span>
+                        </button>
+                      )}
+                      {releaseNotesText && (
+                        <button
+                          type="button"
+                          onClick={() => setShowReleaseNotes((v) => !v)}
+                          className="ui-btn-ghost h-7.5 px-2 text-[11.5px]"
+                        >
+                          <span>
+                            {showReleaseNotes
+                              ? dict.settings.hideReleaseNotes
+                              : dict.settings.releaseNotes}
+                          </span>
+                          {showReleaseNotes ? (
+                            <ChevronUp className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          ) : (
+                            <ChevronDown className="h-3.5 w-3.5" strokeWidth={1.5} />
+                          )}
+                        </button>
+                      )}
+                      {canInAppUpdate && (
+                        <button
+                          type="button"
+                          onClick={() => api.openExternalUrl(updateCheck.releaseUrl)}
+                          title={dict.settings.openRelease}
+                          className="ui-btn-ghost h-7.5 px-2 text-[11.5px]"
+                        >
+                          <ExternalLink className="h-3 w-3" strokeWidth={1.5} />
+                          <span>{dict.settings.openRelease}</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {showReleaseNotes && releaseNotesText && (
+                    <pre className="max-h-40 overflow-y-auto rounded-[8px] border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words text-[var(--text-secondary)]">
+                      {releaseNotesText}
+                    </pre>
+                  )}
+                </div>
+              ) : updateCheck ? (
+                <div className="num-tabular flex items-center gap-1.5 text-[12px] text-[var(--success-text)]">
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" strokeWidth={1.5} />
+                  <span>
+                    {dict.settings.upToDate} (v{updateCheck.latestVersion})
                   </span>
-                )}
-              </div>
-              {updateResult.hasUpdate && (
-                <button
-                  type="button"
-                  onClick={() => api.openExternalUrl(updateResult.releaseUrl)}
-                  className="ui-btn-primary h-7 px-2.5 text-[11.5px]"
-                >
-                  <ExternalLink className="h-3 w-3" strokeWidth={1.5} />
-                  <span>{dict.settings.openRelease}</span>
-                </button>
-              )}
+                </div>
+              ) : null}
             </div>
           )}
         </section>

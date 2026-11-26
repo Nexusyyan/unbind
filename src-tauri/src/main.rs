@@ -5,6 +5,14 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Self-update helper mode: runs from a temporary copy of the binary, waits for the main
+    // app & elevated worker to exit, atomically swaps the executable, and relaunches Unbind.
+    // Must exit before touching Tauri, WebView2, or the single-instance lock.
+    if args.iter().any(|a| a == "--apply-update") {
+        let code = unbind_lib::self_update::run_apply_update_from_args(&args);
+        std::process::exit(code);
+    }
+
     // Dual-mode single-binary support: when spawned with `--elevated-worker`,
     // immediately enter the headless Named Pipe worker loop without touching WebView2/Tauri
     // or the GUI single-instance mutex.

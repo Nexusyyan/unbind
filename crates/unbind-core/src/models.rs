@@ -404,6 +404,10 @@ pub struct WindowBounds {
     pub maximized: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -424,6 +428,8 @@ pub struct AppSettings {
     pub default_track_mode: TrackMode,
     #[serde(default)]
     pub close_to_tray: bool,
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
     #[serde(default)]
     pub window_bounds: Option<WindowBounds>,
 }
@@ -444,6 +450,7 @@ impl Default for AppSettings {
             portable_app_roots: Vec::new(),
             default_track_mode: TrackMode::HybridSnapshot,
             close_to_tray: false,
+            auto_check_updates: true,
             window_bounds: None,
         }
     }
@@ -465,10 +472,74 @@ pub struct SystemStatus {
 pub struct UpdateCheckResult {
     pub current_version: String,
     pub latest_version: String,
+    #[serde(default)]
+    pub latest_tag: String,
     pub has_update: bool,
     pub release_url: String,
     pub published_at: String,
     pub notes_preview: String,
+    #[serde(default)]
+    pub exe_asset_name: Option<String>,
+    #[serde(default)]
+    pub exe_asset_url: Option<String>,
+    #[serde(default)]
+    pub exe_asset_size: Option<u64>,
+    #[serde(default)]
+    pub checksums_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateStage {
+    #[default]
+    Idle,
+    Downloading,
+    Verifying,
+    Ready,
+    Installing,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedUpdateInfo {
+    pub version: String,
+    pub tag: String,
+    pub asset_name: String,
+    pub sha256: String,
+    pub file_size: u64,
+    pub staged_exe_path: String,
+    pub staging_dir: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgressEvent {
+    pub stage: UpdateStage,
+    pub version: String,
+    pub tag: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: f32,
+    pub error: Option<String>,
+    pub staged: Option<StagedUpdateInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStateSnapshot {
+    pub latest_check: Option<UpdateCheckResult>,
+    pub progress: UpdateProgressEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingUpdateOutcome {
+    pub success: bool,
+    pub from_version: String,
+    pub to_version: String,
+    pub error: Option<String>,
+    pub timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
