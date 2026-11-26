@@ -1,5 +1,6 @@
 mod commands;
 mod elevation;
+mod tray;
 
 use commands::AppState;
 use serde::{Deserialize, Serialize};
@@ -78,7 +79,7 @@ fn restore_window_bounds(window: &tauri::WebviewWindow, bounds: &WindowBounds) {
     }
 }
 
-fn persist_window_bounds(window: &tauri::Window, state: &AppState) {
+pub(crate) fn persist_window_bounds(window: &tauri::Window, state: &AppState) {
     if window.is_minimized().unwrap_or(false) {
         return;
     }
@@ -113,6 +114,12 @@ fn persist_window_bounds(window: &tauri::Window, state: &AppState) {
     let _ = storage.save_settings(&settings);
 }
 
+pub(crate) fn persist_main_window_bounds(app: &tauri::AppHandle, state: &AppState) {
+    if let Some(win) = app.get_webview_window("main") {
+        persist_window_bounds(&win.as_ref().window(), state);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(initial_cli_action: Option<CliAction>) {
     let app_state = AppState::new(initial_cli_action);
@@ -120,11 +127,7 @@ pub fn run(initial_cli_action: Option<CliAction>) {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            tray::show_main_window(app);
             if let Some(action) = parse_cli_action(&argv) {
                 if let Some(state) = app.try_state::<AppState>() {
                     if let Ok(mut guard) = state.pending_cli_action.lock() {
@@ -149,12 +152,30 @@ pub fn run(initial_cli_action: Option<CliAction>) {
                     }
                 }
             }
+            tray::setup_tray(app)?;
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
+            if window.label() != "main" {
+                return;
+            }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let mut hide_to_tray = false;
                 if let Some(state) = window.try_state::<AppState>() {
                     persist_window_bounds(window, &state);
+                    let settings = state.current_storage().load_settings();
+                    if settings.close_to_tray && !state.tray.is_exiting() {
+                        hide_to_tray = true;
+                    } else {
+                        state.tray.mark_exiting();
+                    }
+                }
+                if hide_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    tray::update_tray_tooltip(window.app_handle());
+                } else {
+                    window.app_handle().exit(0);
                 }
             }
         })
@@ -162,6 +183,11 @@ pub fn run(initial_cli_action: Option<CliAction>) {
             commands::get_system_status,
             commands::get_settings,
             commands::save_settings,
+            commands::get_tray_snapshot,
+            commands::resize_tray_menu,
+            commands::hide_tray_menu,
+            commands::preview_tray_menu,
+            commands::execute_tray_action,
             commands::list_apps,
             commands::resolve_app_sizes,
             commands::get_app_icons,

@@ -256,7 +256,26 @@ export interface AppSettings {
   customTrackRoots?: string[];
   portableAppRoots?: string[];
   defaultTrackMode?: TrackMode;
+  closeToTray?: boolean;
   windowBounds?: WindowBounds | null;
+}
+
+export interface TraySnapshot {
+  appVersion: string;
+  isElevated: boolean;
+  workerConnected: boolean;
+  portableMode: boolean;
+  mainWindowVisible: boolean;
+  installedCount: number;
+  activeTrackCount: number;
+  language: string;
+  resolvedLocale: string;
+  theme: string;
+  closeToTray: boolean;
+}
+
+export interface TrayNavigatePayload {
+  target: "apps" | "tools" | "tracker" | "settings" | "forceRemove";
 }
 
 export interface SystemStatus {

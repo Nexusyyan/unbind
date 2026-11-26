@@ -374,6 +374,10 @@
     "shellForceLabel": "为文件与文件夹添加「使用 Unbind 强制卸载」右键菜单",
     "shellTrackLabel": "为 .exe / .msi 安装包添加「使用 Unbind 追踪安装」右键菜单",
     "shellUpdated": "资源管理器右键菜单已更新",
+    "trayTitle": "系统托盘与窗口行为",
+    "trayDesc": "在 Windows 通知区域提供与主界面一致的自定义双语托盘面板，支持快捷跳转、语言与主题即时切换。",
+    "closeToTrayLabel": "点击主窗口关闭按钮时最小化到系统托盘（不退出程序）",
+    "previewTrayMenu": "预览托盘菜单",
     "trackRootsTitle": "安装追踪器默认扩展目录",
     "trackRootsDesc": "配置常用的自定义软件安装盘符或目录（如 D:\\Apps），每次追踪安装时将自动纳入快照范围。",
     "trackRootsEmpty": "暂未配置自定义监控目录。",
@@ -398,5 +402,22 @@
     "openRelease": "前往下载",
     "save": "保存设置",
     "saved": "设置已保存"
+  },
+  "tray": {
+    "tooltip": "Unbind - 轻量级 Windows 软件卸载工具",
+    "tooltipTracking": "Unbind - 正在追踪 {count} 项安装",
+    "openMain": "打开主窗口",
+    "apps": "已安装软件",
+    "forceRemove": "强制卸载",
+    "tracker": "安装追踪器",
+    "tools": "系统工具",
+    "settings": "偏好设置",
+    "trackingBadge": "追踪中 {count}",
+    "language": "界面语言",
+    "langEn": "EN",
+    "langZh": "中文",
+    "theme": "界面主题",
+    "quit": "退出 Unbind",
+    "hiddenHint": "已在托盘驻留"
   }
 }

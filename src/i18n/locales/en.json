@@ -374,6 +374,10 @@
     "shellForceLabel": "Add \"Force Remove with Unbind\" to files & folders",
     "shellTrackLabel": "Add \"Track Install with Unbind\" to .exe & .msi installers",
     "shellUpdated": "Explorer context menu updated",
+    "trayTitle": "System Tray & Window",
+    "trayDesc": "Keep Unbind quietly accessible from the Windows notification area with a themed bilingual quick menu.",
+    "closeToTrayLabel": "Minimize to system tray instead of exiting when closing main window",
+    "previewTrayMenu": "Preview Tray Menu",
     "trackRootsTitle": "Install Tracker Default Extra Folders",
     "trackRootsDesc": "Automatically include custom installation drives or folders (e.g. D:\\Apps) in every tracking snapshot.",
     "trackRootsEmpty": "No custom directories configured yet.",
@@ -398,5 +402,22 @@
     "openRelease": "Download Release",
     "save": "Save Settings",
     "saved": "Settings saved"
+  },
+  "tray": {
+    "tooltip": "Unbind - Clean Windows Uninstaller",
+    "tooltipTracking": "Unbind - Tracking {count} installation(s)",
+    "openMain": "Open Unbind",
+    "apps": "Installed Apps",
+    "forceRemove": "Force Removal",
+    "tracker": "Install Tracker",
+    "tools": "System Tools",
+    "settings": "Settings",
+    "trackingBadge": "Tracking {count}",
+    "language": "Language",
+    "langEn": "EN",
+    "langZh": "中文",
+    "theme": "Theme",
+    "quit": "Quit Unbind",
+    "hiddenHint": "Minimized to tray"
   }
 }

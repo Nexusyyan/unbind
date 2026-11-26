@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  AppWindow,
   Check,
   ExternalLink,
   FolderOpen,
@@ -207,6 +208,43 @@ export function SettingsView({
               />
               {dict.common.openDir}
             </button>
+          </div>
+        </section>
+
+        {/* System Tray & Window Behavior */}
+        <section className="ui-card space-y-3.5 p-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <AppWindow
+                className="mt-0.5 h-4 w-4 shrink-0 text-[var(--text-tertiary)]"
+                strokeWidth={1.5}
+              />
+              <div>
+                <div className="text-[13.5px] font-medium text-[var(--text-primary)]">
+                  {dict.settings.trayTitle}
+                </div>
+                <p className="mt-0.5 text-[12px] text-[var(--text-secondary)]">
+                  {dict.settings.trayDesc}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                window.setTimeout(() => void api.previewTrayMenu(), 40);
+              }}
+              className="ui-btn-secondary h-7.5 shrink-0 px-2.5 text-[12px]"
+            >
+              <span>{dict.settings.previewTrayMenu}</span>
+            </button>
+          </div>
+          <div className="divide-y divide-[var(--border-hairline)]">
+            <ToggleRow
+              label={dict.settings.closeToTrayLabel}
+              checked={Boolean(settings.closeToTray)}
+              onChange={(v) => void updateSettings({ closeToTray: v })}
+            />
           </div>
         </section>
 

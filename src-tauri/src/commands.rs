@@ -1,11 +1,15 @@
 use crate::elevation::ElevationBridge;
+use crate::tray::{
+    self, TrayNavigatePayload, TrayRuntimeState, TraySnapshot, TRAY_LOGICAL_WIDTH,
+    TRAY_WINDOW_LABEL,
+};
 use crate::CliAction;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, State};
 use unbind_core::discovery::icon::IconCache;
 use unbind_core::discovery::size::resolve_missing_sizes_batched;
 use unbind_core::discovery::{
@@ -63,6 +67,7 @@ pub struct AppState {
     pub elevation: ElevationBridge,
     pub size_scan_gen: Arc<AtomicU64>,
     pub pending_cli_action: Mutex<Option<CliAction>>,
+    pub tray: TrayRuntimeState,
 }
 
 impl AppState {
@@ -76,6 +81,7 @@ impl AppState {
             elevation: ElevationBridge::new(),
             size_scan_gen: Arc::new(AtomicU64::new(0)),
             pending_cli_action: Mutex::new(initial_cli_action),
+            tray: TrayRuntimeState::new(),
         }
     }
 
@@ -106,7 +112,11 @@ pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
 }
 
 #[tauri::command]
-pub fn save_settings(state: State<'_, AppState>, settings: AppSettings) -> Result<AppSettings, String> {
+pub fn save_settings(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
     let storage = state.current_storage();
     // Preserve stored window bounds when settings form omits them.
     let mut merged = settings;
@@ -117,11 +127,135 @@ pub fn save_settings(state: State<'_, AppState>, settings: AppSettings) -> Resul
     if let Ok(mut guard) = state.storage.lock() {
         *guard = AppStorage::for_dir(PathBuf::from(&updated.data_dir), updated.portable_mode);
     }
+    let _ = app_handle.emit("settings://changed", &updated);
+    tray::update_tray_tooltip(&app_handle);
     Ok(updated)
 }
 
 #[tauri::command]
-pub async fn list_apps(state: State<'_, AppState>) -> Result<Vec<InstalledApp>, String> {
+pub fn get_tray_snapshot(app_handle: AppHandle, state: State<'_, AppState>) -> TraySnapshot {
+    tray::build_tray_snapshot(&app_handle, &state)
+}
+
+#[tauri::command]
+pub fn resize_tray_menu(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    height: f64,
+) -> Result<(), String> {
+    let clamped = state.tray.set_logical_height(height);
+    if let Some(win) = app_handle.get_webview_window(TRAY_WINDOW_LABEL) {
+        let _ = win.set_size(LogicalSize::new(TRAY_LOGICAL_WIDTH, clamped));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn hide_tray_menu(app_handle: AppHandle) {
+    tray::hide_tray_menu(&app_handle);
+}
+
+#[tauri::command]
+pub fn preview_tray_menu(app_handle: AppHandle) {
+    tray::show_tray_menu_at(&app_handle, None);
+}
+
+#[tauri::command]
+pub fn execute_tray_action(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    action: String,
+) -> Result<(), String> {
+    match action.as_str() {
+        "showMain" => {
+            tray::show_main_window(&app_handle);
+        }
+        "nav:apps" => {
+            tray::show_main_window(&app_handle);
+            let _ = app_handle.emit_to(
+                "main",
+                "tray://navigate",
+                TrayNavigatePayload {
+                    target: "apps".to_string(),
+                },
+            );
+        }
+        "nav:tools" => {
+            tray::show_main_window(&app_handle);
+            let _ = app_handle.emit_to(
+                "main",
+                "tray://navigate",
+                TrayNavigatePayload {
+                    target: "tools".to_string(),
+                },
+            );
+        }
+        "nav:tracker" => {
+            tray::show_main_window(&app_handle);
+            let _ = app_handle.emit_to(
+                "main",
+                "tray://navigate",
+                TrayNavigatePayload {
+                    target: "tracker".to_string(),
+                },
+            );
+        }
+        "nav:settings" => {
+            tray::show_main_window(&app_handle);
+            let _ = app_handle.emit_to(
+                "main",
+                "tray://navigate",
+                TrayNavigatePayload {
+                    target: "settings".to_string(),
+                },
+            );
+        }
+        "action:forceRemove" => {
+            tray::show_main_window(&app_handle);
+            let _ = app_handle.emit_to(
+                "main",
+                "tray://navigate",
+                TrayNavigatePayload {
+                    target: "forceRemove".to_string(),
+                },
+            );
+        }
+        "setLanguage:zh-CN" | "setLanguage:en" => {
+            let lang = action.strip_prefix("setLanguage:").unwrap_or("en");
+            let storage = state.current_storage();
+            let mut settings = storage.load_settings();
+            settings.language = lang.to_string();
+            let updated = storage.save_settings(&settings).map_err(|e| e.to_string())?;
+            let _ = app_handle.emit("settings://changed", &updated);
+            tray::update_tray_tooltip(&app_handle);
+        }
+        "setTheme:system" | "setTheme:light" | "setTheme:dark" => {
+            let theme = action.strip_prefix("setTheme:").unwrap_or("system");
+            let storage = state.current_storage();
+            let mut settings = storage.load_settings();
+            settings.theme = theme.to_string();
+            let updated = storage.save_settings(&settings).map_err(|e| e.to_string())?;
+            let _ = app_handle.emit("settings://changed", &updated);
+            tray::update_tray_tooltip(&app_handle);
+        }
+        "quit" => {
+            tray::hide_tray_menu(&app_handle);
+            state.tray.mark_exiting();
+            crate::persist_main_window_bounds(&app_handle, &state);
+            app_handle.exit(0);
+        }
+        other => {
+            return Err(format!("Unknown tray action: {}", other));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_apps(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<InstalledApp>, String> {
     let storage = state.current_storage();
     let traces_dir = storage.traces_dir();
     let cache_file = storage.size_cache_file();
@@ -134,6 +268,7 @@ pub async fn list_apps(state: State<'_, AppState>) -> Result<Vec<InstalledApp>, 
     if let Ok(mut guard) = state.apps_cache.lock() {
         *guard = apps.clone();
     }
+    tray::update_tray_tooltip(&app_handle);
     Ok(apps)
 }
 
@@ -207,8 +342,12 @@ pub async fn get_app_icons(
 }
 
 #[tauri::command]
-pub async fn elevate_session(state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn elevate_session(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
     state.elevation.ensure_connected().map_err(|e| e.to_string())?;
+    tray::update_tray_tooltip(&app_handle);
     Ok(true)
 }
 
@@ -535,10 +674,11 @@ pub async fn start_install_track(
             }
         }
 
+        tray::update_tray_tooltip(&app_handle);
         return Ok(sess);
     }
 
-    state
+    let started = state
         .tracker
         .start_session_with_mode(
             None,
@@ -558,7 +698,9 @@ pub async fn start_install_track(
                 );
             })),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    tray::update_tray_tooltip(&app_handle);
+    Ok(started)
 }
 
 #[tauri::command]
@@ -590,6 +732,7 @@ pub async fn poll_install_track_stats(
 
 #[tauri::command]
 pub async fn finish_install_track(
+    app_handle: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<InstallTrace, String> {
@@ -624,17 +767,24 @@ pub async fn finish_install_track(
         trace.added_scheduled_tasks.len()
     );
     let _ = storage.append_log("install_trace", &trace.app_name, &summary, true);
+    tray::update_tray_tooltip(&app_handle);
     Ok(trace)
 }
 
 #[tauri::command]
-pub fn cancel_install_track(state: State<'_, AppState>, session_id: String) -> bool {
+pub fn cancel_install_track(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> bool {
     if state.tracker.session_uses_etw(&session_id) {
         let _ = state.elevation.execute(WorkerRequest::CancelEtwTrack {
             session_id: session_id.clone(),
         });
     }
-    state.tracker.cancel_session(&session_id)
+    let cancelled = state.tracker.cancel_session(&session_id);
+    tray::update_tray_tooltip(&app_handle);
+    cancelled
 }
 
 #[tauri::command]

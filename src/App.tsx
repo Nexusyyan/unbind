@@ -33,6 +33,7 @@ import type {
   SystemStatus,
   ToastMessage,
   ToolsSubTab,
+  TrayNavigatePayload,
   WingetUpdateInfo,
 } from "./types";
 
@@ -49,6 +50,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   customTrackRoots: [],
   portableAppRoots: [],
   defaultTrackMode: "hybridSnapshot",
+  closeToTray: false,
 };
 
 const DEFAULT_LIST_STATE: AppListViewState = {
@@ -321,6 +323,27 @@ export function App() {
     void listen<CliAction>("cli://action", (event) => {
       if (event.payload) {
         handleCliAction(event.payload);
+      }
+    }).then((u) => unsubs.push(u));
+
+    void listen<TrayNavigatePayload>("tray://navigate", (event) => {
+      const target = event.payload?.target;
+      if (!target) return;
+      if (target === "forceRemove") {
+        setForceModalState({});
+      } else if (
+        target === "apps" ||
+        target === "tools" ||
+        target === "tracker" ||
+        target === "settings"
+      ) {
+        setActiveTab(target);
+      }
+    }).then((u) => unsubs.push(u));
+
+    void listen<AppSettings>("settings://changed", (event) => {
+      if (event.payload) {
+        setSettings(event.payload);
       }
     }).then((u) => unsubs.push(u));
 

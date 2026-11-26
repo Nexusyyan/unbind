@@ -22,6 +22,7 @@ import type {
   StartupItem,
   SystemStatus,
   TrackMode,
+  TraySnapshot,
   UninstallExecutionResult,
   UpdateCheckResult,
   WingetCheckResult,
@@ -62,6 +63,7 @@ export const api = {
         customTrackRoots: [],
         portableAppRoots: [],
         defaultTrackMode: "hybridSnapshot",
+        closeToTray: false,
       };
     }
     return invoke<AppSettings>("get_settings");
@@ -70,6 +72,45 @@ export const api = {
   async saveSettings(settings: AppSettings): Promise<AppSettings> {
     if (!isTauriRuntime()) return settings;
     return invoke<AppSettings>("save_settings", { settings });
+  },
+
+  async getTraySnapshot(): Promise<TraySnapshot> {
+    if (!isTauriRuntime()) {
+      return {
+        appVersion: "0.5.0",
+        isElevated: false,
+        workerConnected: false,
+        portableMode: true,
+        mainWindowVisible: true,
+        installedCount: 42,
+        activeTrackCount: 0,
+        language: "auto",
+        resolvedLocale: "en",
+        theme: "system",
+        closeToTray: false,
+      };
+    }
+    return invoke<TraySnapshot>("get_tray_snapshot");
+  },
+
+  async resizeTrayMenu(height: number): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("resize_tray_menu", { height });
+  },
+
+  async hideTrayMenu(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("hide_tray_menu");
+  },
+
+  async previewTrayMenu(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("preview_tray_menu");
+  },
+
+  async executeTrayAction(action: string): Promise<void> {
+    if (!isTauriRuntime()) return;
+    return invoke<void>("execute_tray_action", { action });
   },
 
   async listApps(): Promise<InstalledApp[]> {

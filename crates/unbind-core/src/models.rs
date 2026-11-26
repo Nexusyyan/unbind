@@ -423,6 +423,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub default_track_mode: TrackMode,
     #[serde(default)]
+    pub close_to_tray: bool,
+    #[serde(default)]
     pub window_bounds: Option<WindowBounds>,
 }
 
@@ -441,6 +443,7 @@ impl Default for AppSettings {
             custom_track_roots: Vec::new(),
             portable_app_roots: Vec::new(),
             default_track_mode: TrackMode::HybridSnapshot,
+            close_to_tray: false,
             window_bounds: None,
         }
     }
